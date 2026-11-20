@@ -1,0 +1,72 @@
+name: BRN CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install native build and fixture tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            clang \
+            pkg-config \
+            openssl
+
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable \
+            --profile minimal \
+            --component rustfmt \
+            --component clippy
+
+      - name: Require root lockfile
+        run: test -f Cargo.lock
+
+      - name: Check formatting
+        run: |
+          cargo +stable fmt --all --check
+          cargo +stable fmt --manifest-path fuzz/Cargo.toml --all --check
+
+      - name: Generate disposable TLS fixtures
+        run: bash scripts/generate-test-certs.sh --force
+
+      - name: Debug tests
+        run: cargo +stable test --locked --all-targets
+
+      - name: Release tests
+        run: cargo +stable test --locked --release --all-targets
+
+      - name: Strict Clippy
+        run: cargo +stable clippy --locked --all-targets -- -D warnings
+
+      - name: Documentation
+        run: cargo +stable doc --locked --no-deps

@@ -1,0 +1,42 @@
+# Rust build output
+/target/
+/fuzz/target/
+
+# Fuzz findings and generated reports
+# Keep fuzz/corpus/ committed as regression input.
+/fuzz/artifacts/
+/fuzz/coverage/
+/fuzz-logs/
+
+# Coverage and profiling output
+/coverage/
+*.profraw
+*.profdata
+
+# Generated disposable TLS fixtures
+/certs/ca.cert.der
+/certs/server.cert.der
+/certs/server.key.der
+
+# Private-key files in the certificate directory
+/certs/*.key
+/certs/*.key.pem
+/certs/*.key.der
+
+# Local environment files
+/.env
+/.env.*
+!/.env.example
+
+# Editor temporary files
+*.swp
+*.swo
+*~
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+
+# Keep dependency lockfiles committed
+!/Cargo.lock
+!/fuzz/Cargo.lock

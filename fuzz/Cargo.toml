@@ -1,0 +1,57 @@
+[package]
+name = "brn-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+brn = { path = ".." }
+
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "frame_header"
+path = "fuzz_targets/frame_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "authentication"
+path = "fuzz_targets/authentication.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "key_offer"
+path = "fuzz_targets/key_offer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope_header"
+path = "fuzz_targets/envelope_header.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "open_arbitrary"
+path = "fuzz_targets/open_arbitrary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "open_mutated"
+path = "fuzz_targets/open_mutated.rs"
+test = false
+doc = false
+bench = false
