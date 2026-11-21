@@ -23,6 +23,9 @@ impl DeadlineTcpStream {
             ));
         }
 
+        // BRN uses sequential request/response exchanges.
+        socket.set_nodelay(true)?;
+
         Ok(Self {
             socket,
             io_timeout,

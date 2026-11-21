@@ -76,6 +76,16 @@ mod auth_wire;
 mod client;
 mod envelope;
 mod epoch;
+mod file_connection;
+mod file_disk;
+pub mod file_download;
+mod file_source;
+mod file_state;
+mod file_store;
+mod file_transfer;
+mod file_upload;
+mod file_verify;
+mod file_wire;
 mod frame;
 mod handshake;
 mod key_exchange;
@@ -102,6 +112,11 @@ pub use api::{
 };
 
 pub use auth::{AuthenticationError, Authenticator, ClientIdentity, InvalidIdentity};
+pub use epoch::ApplicationKeyCapacity;
+pub use file_connection::{FileUploadConnection, FileUploadRotation};
+pub use file_source::FileUploadSource;
+pub use file_transfer::{FileCleanupReport, FileTransferLimits, FileTransferService};
+pub use file_upload::{FileUpload, FileUploadStatus, MAX_FILE_CHUNK_LEN};
 
 /// Maximum plaintext payload size for one application request or response.
 ///
@@ -119,6 +134,9 @@ mod tls_tests;
 
 #[cfg(test)]
 mod connection_tests;
+
+#[cfg(test)]
+mod file_transfer_tests;
 
 // Parser harnesses are available only to tests and fuzzing builds.
 #[cfg(any(test, fuzzing))]

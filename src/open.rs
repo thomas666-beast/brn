@@ -342,3 +342,85 @@ mod tests {
 #[cfg(test)]
 #[path = "open_adversarial_tests.rs"]
 mod adversarial_tests;
+
+impl MessageOpener {
+    /// Remaining (plaintext bytes, messages) for this receiving owner.
+    ///
+    /// Includes usage by all message purposes, including confirmation.
+    /// Does not change state or inspect epoch age.
+    pub(crate) fn remaining_capacity(&self) -> (u64, u64) {
+        if self.failed {
+            return (0, 0);
+        }
+
+        (
+            MAX_PLAINTEXT_BYTES_PER_KEY.saturating_sub(self.plaintext_bytes),
+            MAX_MESSAGES_PER_KEY.saturating_sub(self.next_sequence),
+        )
+    }
+}
+
+#[cfg(test)]
+impl MessageOpener {
+    /// Reduces remaining capacity without changing the expected sequence.
+    pub(crate) fn restrict_plaintext_capacity_for_test(&mut self, remaining: u64) {
+        let current = self.remaining_capacity().0;
+        let remaining = current.min(remaining);
+
+        self.plaintext_bytes = MAX_PLAINTEXT_BYTES_PER_KEY.saturating_sub(remaining);
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    use crate::seal::MessageSealer;
+
+    fn receiver() -> MessageOpener {
+        MessageOpener::new(&[0x42; 32], Direction::ClientToServer).unwrap()
+    }
+
+    #[test]
+    fn inspection_tracks_authenticated_usage_without_consuming_it() {
+        let mut receiver = receiver();
+
+        let initial = (MAX_PLAINTEXT_BYTES_PER_KEY, MAX_MESSAGES_PER_KEY);
+
+        assert_eq!(receiver.remaining_capacity(), initial);
+        assert_eq!(receiver.remaining_capacity(), initial);
+
+        let mut sender = MessageSealer::new(&[0x42; 32], Direction::ClientToServer).unwrap();
+
+        let message = sender.seal(MessagePurpose::Request, b"abc").unwrap();
+
+        receiver
+            .open(message.body(), MessagePurpose::Request)
+            .unwrap();
+
+        assert_eq!(
+            receiver.remaining_capacity(),
+            (MAX_PLAINTEXT_BYTES_PER_KEY - 3, MAX_MESSAGES_PER_KEY - 1,)
+        );
+    }
+
+    #[test]
+    fn failed_owner_reports_no_usable_capacity() {
+        let mut receiver = receiver();
+
+        receiver.failed = true;
+
+        assert_eq!(receiver.remaining_capacity(), (0, 0));
+    }
+
+    #[test]
+    fn exhausted_message_counter_reports_zero_messages() {
+        let mut receiver = receiver();
+
+        receiver.next_sequence = MAX_MESSAGES_PER_KEY;
+
+        assert_eq!(
+            receiver.remaining_capacity(),
+            (MAX_PLAINTEXT_BYTES_PER_KEY, 0)
+        );
+    }
+}

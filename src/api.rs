@@ -469,6 +469,73 @@ impl ReadyServer {
     }
 }
 
+impl ReadyClient {
+    /// Reports this endpoint's remaining local application-key capacity.
+    ///
+    /// Performs no network I/O and consumes no message counters.
+    /// Unlike is_closed(), this checks local key expiration.
+    ///
+    /// On error, the application exchange is permanently aborted.
+    ///
+    /// A successful snapshot does not reserve capacity or guarantee
+    /// peer availability or successful completion of the next request.
+    pub fn application_key_capacity(&mut self) -> io::Result<crate::epoch::ApplicationKeyCapacity> {
+        let result = if self.session.state() == ConnectionState::Closed {
+            Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "BRN session is closed",
+            ))
+        } else {
+            self.epoch.capacity()
+        };
+
+        if result.is_err() {
+            self.abort_application_exchange();
+        }
+
+        result
+    }
+}
+
+impl ReadyServer {
+    /// Reports this endpoint's remaining local application-key capacity.
+    ///
+    /// Performs no network I/O and consumes no message counters.
+    /// Observed expiration or another reporting error aborts the
+    /// application exchange.
+    ///
+    /// Sending/receiving are relative to this server endpoint.
+    pub fn application_key_capacity(&mut self) -> io::Result<crate::epoch::ApplicationKeyCapacity> {
+        let result = if self.session.state() == ConnectionState::Closed {
+            Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "BRN session is closed",
+            ))
+        } else {
+            self.epoch.capacity()
+        };
+
+        if result.is_err() {
+            self.abort_application_exchange();
+        }
+
+        result
+    }
+}
+
+#[cfg(test)]
+impl ReadyClient {
+    pub(crate) fn restrict_capacity_for_test(
+        &mut self,
+        send_bytes: u64,
+        receive_bytes: u64,
+        remaining_lifetime: Option<Duration>,
+    ) -> io::Result<()> {
+        self.epoch
+            .restrict_capacity_for_test(send_bytes, receive_bytes, remaining_lifetime)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

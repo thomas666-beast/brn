@@ -180,6 +180,37 @@ fn disabled_error() -> io::Error {
 }
 
 #[cfg(test)]
+impl KeyEpoch {
+    pub(crate) fn restrict_capacity_for_test(
+        &mut self,
+        send_bytes: u64,
+        receive_bytes: u64,
+        remaining_lifetime: Option<Duration>,
+    ) -> io::Result<()> {
+        let now = Instant::now();
+        self.ensure_live_at(now)?;
+
+        if let Some(lifetime) = remaining_lifetime {
+            let requested_expiration = now.checked_add(lifetime).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "test lifetime overflow")
+            })?;
+
+            // Never extend the existing epoch.
+            self.expires_at = self.expires_at.min(requested_expiration);
+        }
+
+        let keys = self.keys.as_mut().ok_or_else(disabled_error)?;
+
+        keys.sender.restrict_plaintext_capacity_for_test(send_bytes);
+
+        keys.receiver
+            .restrict_plaintext_capacity_for_test(receive_bytes);
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -920,3 +951,232 @@ mod tests {
 #[cfg(test)]
 #[path = "epoch_adversarial_tests.rs"]
 mod adversarial_tests;
+
+/// Local snapshot of an application-key epoch's remaining capacity.
+///
+/// Sending and receiving are relative to the endpoint reporting it.
+///
+/// Byte budgets count application plaintext, including application
+/// protocol metadata and key-confirmation plaintext. They do not count
+/// TLS bytes, ciphertext authentication tags, or outer frame headers.
+///
+/// This snapshot reserves nothing. Time and later operations may
+/// invalidate it. It does not report the peer's remaining lifetime
+/// or guarantee that the next operation will succeed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApplicationKeyCapacity {
+    pub send_plaintext_bytes: u64,
+    pub send_messages: u64,
+    pub receive_plaintext_bytes: u64,
+    pub receive_messages: u64,
+    pub remaining_lifetime: Duration,
+}
+
+impl KeyEpoch {
+    /// Reports current local capacity without consuming counters.
+    ///
+    /// Observed expiration disables the epoch and drops both owners,
+    /// just like other epoch operations.
+    pub(crate) fn capacity(&mut self) -> io::Result<ApplicationKeyCapacity> {
+        self.capacity_at(Instant::now())
+    }
+
+    fn capacity_at(&mut self, now: Instant) -> io::Result<ApplicationKeyCapacity> {
+        self.ensure_live_at(now)?;
+
+        let remaining_lifetime = match self.expires_at.checked_duration_since(now) {
+            Some(remaining) if !remaining.is_zero() => remaining,
+            _ => {
+                self.disable();
+
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "application-key epoch expired",
+                ));
+            }
+        };
+
+        let keys = self.keys.as_ref().ok_or_else(disabled_error)?;
+
+        let (send_plaintext_bytes, send_messages) = keys.sender.remaining_capacity();
+
+        let (receive_plaintext_bytes, receive_messages) = keys.receiver.remaining_capacity();
+
+        Ok(ApplicationKeyCapacity {
+            send_plaintext_bytes,
+            send_messages,
+            receive_plaintext_bytes,
+            receive_messages,
+            remaining_lifetime,
+        })
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    use crate::seal::MAX_PLAINTEXT_BYTES_PER_KEY;
+    use crate::sequence::MAX_MESSAGES_PER_KEY;
+
+    fn material() -> TemporaryKeys {
+        let mut bytes = [0x11; 64];
+        bytes[32..].fill(0x22);
+
+        TemporaryKeys::from_bytes(&bytes).unwrap()
+    }
+
+    #[test]
+    fn inspection_does_not_consume_capacity_or_drop_owners() {
+        let now = Instant::now();
+
+        let mut epoch = KeyEpoch::new_at(material(), EndpointRole::Client, now).unwrap();
+
+        let first = epoch.capacity_at(now).unwrap();
+        let second = epoch.capacity_at(now).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first.send_plaintext_bytes, MAX_PLAINTEXT_BYTES_PER_KEY);
+        assert_eq!(first.receive_plaintext_bytes, MAX_PLAINTEXT_BYTES_PER_KEY);
+        assert_eq!(first.send_messages, MAX_MESSAGES_PER_KEY);
+        assert_eq!(first.receive_messages, MAX_MESSAGES_PER_KEY);
+        assert_eq!(first.remaining_lifetime, KEY_LIFETIME);
+        assert!(epoch.keys.is_some());
+
+        let message = epoch.seal(MessagePurpose::Request, b"abc").unwrap();
+
+        assert_eq!(message.sequence(), 0);
+    }
+
+    #[test]
+    fn request_and_response_usage_are_endpoint_relative() {
+        let mut client = KeyEpoch::for_client(material()).unwrap();
+        let mut server = KeyEpoch::for_server(material()).unwrap();
+
+        let request = client.seal(MessagePurpose::Request, b"abc").unwrap();
+
+        server
+            .open(request.body(), MessagePurpose::Request)
+            .unwrap();
+
+        let response = server.seal(MessagePurpose::Response, b"hello").unwrap();
+
+        client
+            .open(response.body(), MessagePurpose::Response)
+            .unwrap();
+
+        let client_capacity = client.capacity().unwrap();
+        let server_capacity = server.capacity().unwrap();
+
+        assert_eq!(
+            client_capacity.send_plaintext_bytes,
+            MAX_PLAINTEXT_BYTES_PER_KEY - 3
+        );
+        assert_eq!(
+            client_capacity.receive_plaintext_bytes,
+            MAX_PLAINTEXT_BYTES_PER_KEY - 5
+        );
+        assert_eq!(
+            server_capacity.send_plaintext_bytes,
+            client_capacity.receive_plaintext_bytes
+        );
+        assert_eq!(
+            server_capacity.receive_plaintext_bytes,
+            client_capacity.send_plaintext_bytes
+        );
+
+        assert_eq!(client_capacity.send_messages, MAX_MESSAGES_PER_KEY - 1);
+        assert_eq!(client_capacity.receive_messages, MAX_MESSAGES_PER_KEY - 1);
+        assert_eq!(server_capacity.send_messages, MAX_MESSAGES_PER_KEY - 1);
+        assert_eq!(server_capacity.receive_messages, MAX_MESSAGES_PER_KEY - 1);
+    }
+
+    #[test]
+    fn key_confirmation_counts_toward_reported_capacity() {
+        let mut client = KeyEpoch::for_client(material()).unwrap();
+        let mut server = KeyEpoch::for_server(material()).unwrap();
+
+        let confirmation = client
+            .seal(MessagePurpose::KeyConfirmation, b"confirm")
+            .unwrap();
+
+        server
+            .open(confirmation.body(), MessagePurpose::KeyConfirmation)
+            .unwrap();
+
+        let client_capacity = client.capacity().unwrap();
+        let server_capacity = server.capacity().unwrap();
+
+        assert_eq!(
+            client_capacity.send_plaintext_bytes,
+            MAX_PLAINTEXT_BYTES_PER_KEY - 7
+        );
+        assert_eq!(client_capacity.send_messages, MAX_MESSAGES_PER_KEY - 1);
+
+        assert_eq!(
+            server_capacity.receive_plaintext_bytes,
+            MAX_PLAINTEXT_BYTES_PER_KEY - 7
+        );
+        assert_eq!(server_capacity.receive_messages, MAX_MESSAGES_PER_KEY - 1);
+
+        assert_eq!(
+            client_capacity.receive_plaintext_bytes,
+            MAX_PLAINTEXT_BYTES_PER_KEY
+        );
+        assert_eq!(
+            server_capacity.send_plaintext_bytes,
+            MAX_PLAINTEXT_BYTES_PER_KEY
+        );
+    }
+
+    #[test]
+    fn reports_remaining_lifetime_without_renewing_it() {
+        let now = Instant::now();
+
+        let mut epoch = KeyEpoch::new_at(material(), EndpointRole::Client, now).unwrap();
+
+        let near_expiry = now + KEY_LIFETIME - Duration::from_secs(2);
+
+        assert_eq!(
+            epoch.capacity_at(near_expiry).unwrap().remaining_lifetime,
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            epoch.capacity_at(near_expiry).unwrap().remaining_lifetime,
+            Duration::from_secs(2)
+        );
+
+        assert_eq!(epoch.expires_at, now + KEY_LIFETIME);
+        assert!(epoch.keys.is_some());
+    }
+
+    #[test]
+    fn capacity_observes_expiration_and_removes_both_owners() {
+        let now = Instant::now();
+
+        let mut epoch = KeyEpoch::new_at(material(), EndpointRole::Client, now).unwrap();
+
+        let boundary = epoch.expires_at;
+
+        assert_eq!(
+            epoch.capacity_at(boundary).unwrap_err().kind(),
+            io::ErrorKind::TimedOut
+        );
+
+        assert!(epoch.keys.is_none());
+
+        // Earlier test time cannot reactivate a disabled epoch.
+        assert!(epoch.capacity_at(now).is_err());
+        assert!(epoch.keys.is_none());
+    }
+
+    #[test]
+    fn explicitly_disabled_epoch_cannot_report_live_capacity() {
+        let mut epoch = KeyEpoch::for_client(material()).unwrap();
+
+        epoch.disable();
+
+        assert!(epoch.capacity().is_err());
+        assert!(epoch.keys.is_none());
+    }
+}

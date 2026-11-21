@@ -188,3 +188,15 @@ fn timeout_arithmetic_handles_subsecond_and_final_nanosecond_budgets() {
         io::ErrorKind::TimedOut
     );
 }
+
+#[test]
+fn constructor_enables_tcp_nodelay() {
+    let (socket, _peer) = sockets();
+
+    socket.set_nodelay(false).unwrap();
+    assert!(!socket.nodelay().unwrap());
+
+    let transport = DeadlineTcpStream::new(socket, Duration::from_secs(2)).unwrap();
+
+    assert!(transport.socket.nodelay().unwrap());
+}

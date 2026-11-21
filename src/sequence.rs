@@ -143,3 +143,39 @@ mod tests {
         assert_eq!(sequence.next, u64::MAX);
     }
 }
+
+impl SendSequence {
+    /// Remaining reservations before this sending sequence is exhausted.
+    ///
+    /// Does not reserve a sequence or change state.
+    pub(crate) fn remaining(&self) -> u64 {
+        MAX_MESSAGES_PER_KEY.saturating_sub(self.next)
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    #[test]
+    fn inspection_does_not_consume_sequence() {
+        let mut sequence = SendSequence::new();
+
+        assert_eq!(sequence.remaining(), MAX_MESSAGES_PER_KEY);
+        assert_eq!(sequence.remaining(), MAX_MESSAGES_PER_KEY);
+
+        let reserved = sequence.reserve().unwrap();
+
+        assert_eq!(reserved.number(), 0);
+        assert_eq!(sequence.remaining(), MAX_MESSAGES_PER_KEY - 1);
+    }
+
+    #[test]
+    fn exhausted_or_invalid_counter_reports_zero() {
+        for next in [MAX_MESSAGES_PER_KEY, u64::MAX] {
+            let sequence = SendSequence { next };
+
+            assert_eq!(sequence.remaining(), 0);
+        }
+    }
+}

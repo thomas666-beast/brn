@@ -314,3 +314,80 @@ mod tests {
 #[cfg(test)]
 #[path = "seal_adversarial_tests.rs"]
 mod adversarial_tests;
+
+impl MessageSealer {
+    /// Remaining (plaintext bytes, messages) for this sending owner.
+    ///
+    /// Includes usage by all message purposes, including confirmation.
+    /// Does not reserve capacity, change state, or inspect epoch age.
+    pub(crate) fn remaining_capacity(&self) -> (u64, u64) {
+        if self.exhausted {
+            return (0, 0);
+        }
+
+        (
+            MAX_PLAINTEXT_BYTES_PER_KEY.saturating_sub(self.plaintext_bytes),
+            self.sequence.remaining(),
+        )
+    }
+}
+
+#[cfg(test)]
+impl MessageSealer {
+    /// Reduces remaining capacity without changing sequence allocation.
+    pub(crate) fn restrict_plaintext_capacity_for_test(&mut self, remaining: u64) {
+        let current = self.remaining_capacity().0;
+        let remaining = current.min(remaining);
+
+        self.plaintext_bytes = MAX_PLAINTEXT_BYTES_PER_KEY.saturating_sub(remaining);
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+    use crate::sequence::MAX_MESSAGES_PER_KEY;
+
+    fn sender() -> MessageSealer {
+        MessageSealer::new(&[0x42; 32], Direction::ClientToServer).unwrap()
+    }
+
+    #[test]
+    fn inspection_does_not_consume_capacity() {
+        let mut sender = sender();
+
+        let initial = (MAX_PLAINTEXT_BYTES_PER_KEY, MAX_MESSAGES_PER_KEY);
+
+        assert_eq!(sender.remaining_capacity(), initial);
+        assert_eq!(sender.remaining_capacity(), initial);
+
+        let sealed = sender.seal(MessagePurpose::Request, b"abc").unwrap();
+
+        assert_eq!(sealed.sequence(), 0);
+        assert_eq!(
+            sender.remaining_capacity(),
+            (MAX_PLAINTEXT_BYTES_PER_KEY - 3, MAX_MESSAGES_PER_KEY - 1,)
+        );
+    }
+
+    #[test]
+    fn empty_message_consumes_a_message_but_no_plaintext_bytes() {
+        let mut sender = sender();
+
+        sender.seal(MessagePurpose::Request, b"").unwrap();
+
+        assert_eq!(
+            sender.remaining_capacity(),
+            (MAX_PLAINTEXT_BYTES_PER_KEY, MAX_MESSAGES_PER_KEY - 1,)
+        );
+    }
+
+    #[test]
+    fn exhausted_owner_reports_no_usable_capacity() {
+        let mut sender = sender();
+
+        sender.exhausted = true;
+
+        assert_eq!(sender.remaining_capacity(), (0, 0));
+    }
+}
