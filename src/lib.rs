@@ -92,6 +92,7 @@ mod key_exchange;
 mod key_wire;
 mod keys;
 mod negotiation;
+pub mod net;
 mod open;
 mod phase;
 mod policy;

@@ -10,6 +10,7 @@ use crate::client::{ClientTimeouts, ClientTlsStream, connect_tls};
 use crate::envelope::MessagePurpose;
 use crate::epoch::KeyEpoch;
 use crate::frame::FrameKind;
+use crate::net::{AcceptedConnection, ConnectionInfo};
 use crate::secure_io::run_encrypted_phase;
 use crate::server::{ServerTimeouts, ServerTlsStream, accept_tls};
 use crate::session::Session;
@@ -138,9 +139,13 @@ impl Server {
     /// Completes TLS and BRN negotiation on an accepted blocking socket.
     ///
     /// The application owns listener policy and connection concurrency.
+    /// Completes TLS and BRN negotiation on an accepted blocking socket.
+    ///
+    /// Retained for applications managing their own TCP listener.
     pub fn accept(&self, socket: TcpStream) -> io::Result<PendingServer> {
-        // Enforce the blocking mode expected by this implementation.
         socket.set_nonblocking(false)?;
+
+        let connection_info = ConnectionInfo::from_stream(&socket)?;
 
         let server_timeouts = ServerTimeouts::new(self.timeouts.handshake, self.timeouts.io)?;
 
@@ -148,7 +153,15 @@ impl Server {
 
         session.negotiate_server_with_deadline(self.timeouts.negotiation)?;
 
-        Ok(PendingServer { session })
+        Ok(PendingServer {
+            session,
+            connection_info,
+        })
+    }
+
+    /// Completes TLS and BRN negotiation on a core-owned connection.
+    pub fn accept_connection(&self, connection: AcceptedConnection) -> io::Result<PendingServer> {
+        self.accept(connection.into_stream())
     }
 }
 
@@ -158,6 +171,7 @@ impl Server {
 /// are not yet available.
 pub struct PendingServer {
     session: Session<ServerTlsStream>,
+    connection_info: ConnectionInfo,
 }
 
 impl PendingServer {
@@ -176,6 +190,7 @@ impl PendingServer {
         Ok(AuthenticatedServer {
             session: self.session,
             identity,
+            connection_info: self.connection_info,
         })
     }
 
@@ -220,6 +235,7 @@ impl AuthenticatedClient {
 pub struct AuthenticatedServer {
     session: Session<ServerTlsStream>,
     identity: ClientIdentity,
+    connection_info: ConnectionInfo,
 }
 
 impl AuthenticatedServer {
@@ -244,6 +260,7 @@ impl AuthenticatedServer {
             epoch,
             identity: self.identity,
             exchange: Exchange::server(),
+            connection_info: self.connection_info,
         })
     }
 
@@ -354,6 +371,7 @@ pub struct ReadyServer {
     epoch: KeyEpoch,
     identity: ClientIdentity,
     exchange: Exchange,
+    connection_info: ConnectionInfo,
 }
 
 impl ReadyServer {
@@ -466,6 +484,13 @@ impl ReadyServer {
     /// will succeed.
     pub fn is_closed(&self) -> bool {
         self.session.state() == ConnectionState::Closed
+    }
+
+    /// Returns the endpoint addresses captured during connection setup.
+    ///
+    /// Performs no network I/O.
+    pub fn connection_info(&self) -> &ConnectionInfo {
+        &self.connection_info
     }
 }
 
