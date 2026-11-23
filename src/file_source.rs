@@ -147,13 +147,23 @@ impl FileUploadSource {
     ///
     /// For resumption, use a fresh server-confirmed offset.
     pub fn read_chunk(&mut self, offset: u64) -> io::Result<&[u8]> {
+        self.read_chunk_limited(offset, MAX_FILE_CHUNK_LEN)
+    }
+
+    fn read_chunk_limited(&mut self, offset: u64, max_length: usize) -> io::Result<&[u8]> {
+        if max_length == 0 {
+            return Err(invalid_input("upload chunk capacity is zero"));
+        }
+
         if offset > self.size {
             return Err(invalid_input("upload source offset exceeds EOF"));
         }
 
         self.check_unchanged()?;
 
-        let length = (self.size - offset).min(self.buffer.len() as u64);
+        let capacity = self.buffer.len().min(max_length);
+
+        let length = (self.size - offset).min(capacity as u64);
         let length = usize::try_from(length)
             .map_err(|_| invalid_input("upload source chunk length overflow"))?;
 
@@ -192,7 +202,11 @@ impl FileUploadSource {
 
         self.check_upload(upload)?;
 
-        let bytes = self.read_chunk(confirmed_offset)?;
+        let payload_limit = connection.max_request_payload_len()?;
+
+        let chunk_limit = crate::file_wire::max_chunk_len_for_payload_limit(payload_limit)?;
+
+        let bytes = self.read_chunk_limited(confirmed_offset, chunk_limit)?;
 
         if bytes.is_empty() {
             return Err(invalid_input(
@@ -459,5 +473,24 @@ mod tests {
 
         assert_eq!(source.read_chunk(2).unwrap(), b"cdef");
         assert_eq!(source.read_chunk(0).unwrap(), b"abcdef");
+    }
+
+    #[test]
+    fn limited_reads_preserve_offsets_and_default_read_behavior() {
+        let directory = TestDirectory::new();
+        let path = directory.file();
+
+        fs::write(&path, b"abcdefghij").unwrap();
+
+        let mut source = FileUploadSource::open(&path, 100).unwrap();
+
+        assert_eq!(source.read_chunk_limited(0, 4).unwrap(), b"abcd");
+        assert_eq!(source.read_chunk_limited(4, 4).unwrap(), b"efgh");
+        assert_eq!(source.read_chunk_limited(8, 4).unwrap(), b"ij");
+        assert!(source.read_chunk_limited(10, 4).unwrap().is_empty());
+        assert!(source.read_chunk_limited(11, 4).is_err());
+        assert!(source.read_chunk_limited(0, 0).is_err());
+
+        assert_eq!(source.read_chunk(0).unwrap(), b"abcdefghij");
     }
 }

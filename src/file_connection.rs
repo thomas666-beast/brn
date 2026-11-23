@@ -36,9 +36,14 @@ impl Default for FileUploadRotation {
 ///
 /// Upload handles and local file sources remain owned by the caller.
 ///
-/// Failed operations leave this wrapper without a connection. They
-/// are never automatically replayed. Query upload status before
-/// resuming after an uncertain chunk result.
+/// Once a connection is handed to an upload operation, an error leaves
+/// this wrapper without a retained connection and resets its exchange
+/// count. The wrapper never automatically replays the operation.
+///
+/// Invalid operation budgets are rejected before changing a retained
+/// connection.
+///
+/// Query upload status before resuming after an uncertain chunk result.
 pub struct FileUploadConnection<C>
 where
     C: FnMut() -> io::Result<ReadyClient>,
@@ -72,11 +77,55 @@ where
 
     pub fn begin(&mut self, source: &FileUploadSource, budget: Duration) -> io::Result<FileUpload> {
         let connection = self.prepare(budget)?;
-        let (connection, upload) = source.begin(connection, budget)?;
 
-        self.commit_success(connection);
+        match source.begin(connection, budget) {
+            Ok((connection, upload)) => {
+                self.commit_success(connection);
+                Ok(upload)
+            }
+            Err(error) => {
+                self.successful_exchanges = 0;
+                Err(error)
+            }
+        }
+    }
 
-        Ok(upload)
+    pub fn status(
+        &mut self,
+        upload: &FileUpload,
+        budget: Duration,
+    ) -> io::Result<FileUploadStatus> {
+        let connection = self.prepare(budget)?;
+
+        match upload.status(connection, budget) {
+            Ok((connection, status)) => {
+                self.commit_success(connection);
+                Ok(status)
+            }
+            Err(error) => {
+                self.successful_exchanges = 0;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn finish(
+        &mut self,
+        upload: &FileUpload,
+        budget: Duration,
+    ) -> io::Result<FileUploadStatus> {
+        let connection = self.prepare(budget)?;
+
+        match upload.finish(connection, budget) {
+            Ok((connection, status)) => {
+                self.commit_success(connection);
+                Ok(status)
+            }
+            Err(error) => {
+                self.successful_exchanges = 0;
+                Err(error)
+            }
+        }
     }
 
     /// Sends one source chunk using an already confirmed server offset.
@@ -92,47 +141,31 @@ where
     ) -> io::Result<u64> {
         let connection = self.prepare(budget)?;
 
-        let (connection, next_offset) =
-            source.send_next(upload, connection, confirmed_offset, budget)?;
-
-        self.commit_success(connection);
-
-        Ok(next_offset)
-    }
-
-    pub fn status(
-        &mut self,
-        upload: &FileUpload,
-        budget: Duration,
-    ) -> io::Result<FileUploadStatus> {
-        let connection = self.prepare(budget)?;
-        let (connection, status) = upload.status(connection, budget)?;
-
-        self.commit_success(connection);
-
-        Ok(status)
-    }
-
-    pub fn finish(
-        &mut self,
-        upload: &FileUpload,
-        budget: Duration,
-    ) -> io::Result<FileUploadStatus> {
-        let connection = self.prepare(budget)?;
-        let (connection, status) = upload.finish(connection, budget)?;
-
-        self.commit_success(connection);
-
-        Ok(status)
+        match source.send_next(upload, connection, confirmed_offset, budget) {
+            Ok((connection, next_offset)) => {
+                self.commit_success(connection);
+                Ok(next_offset)
+            }
+            Err(error) => {
+                self.successful_exchanges = 0;
+                Err(error)
+            }
+        }
     }
 
     pub fn abort(&mut self, upload: &FileUpload, budget: Duration) -> io::Result<()> {
         let connection = self.prepare(budget)?;
-        let connection = upload.abort(connection, budget)?;
 
-        self.commit_success(connection);
-
-        Ok(())
+        match upload.abort(connection, budget) {
+            Ok(connection) => {
+                self.commit_success(connection);
+                Ok(())
+            }
+            Err(error) => {
+                self.successful_exchanges = 0;
+                Err(error)
+            }
+        }
     }
 
     /// Drops the current connection but retains the connector.
@@ -166,9 +199,6 @@ where
             if usable {
                 // Ownership leaves the wrapper during the operation.
                 // If it fails, no uncertain connection is retained.
-                self.successful_exchanges =
-                    self.successful_exchanges.min(self.policy.max_exchanges);
-
                 return Ok(connection);
             }
 

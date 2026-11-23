@@ -5,6 +5,7 @@ use crate::state::{ConnectionEvent, ConnectionLifecycle, ConnectionState, Transi
 use crate::wire::{Frame, read_frame_checked, write_frame};
 use std::time::{Duration, Instant};
 
+use crate::negotiation::v2::Profile;
 use crate::phase::PhaseDeadline;
 
 /// Owns the stream and enforces connection lifecycle ordering.
@@ -15,6 +16,7 @@ use crate::phase::PhaseDeadline;
 pub(crate) struct Session<S> {
     stream: Option<S>,
     lifecycle: ConnectionLifecycle,
+    padding_profile: Option<Profile>,
 }
 
 impl<S> Session<S> {
@@ -22,6 +24,7 @@ impl<S> Session<S> {
         Self {
             stream: Some(stream),
             lifecycle: ConnectionLifecycle::new(),
+            padding_profile: None,
         }
     }
 
@@ -35,6 +38,7 @@ impl<S> Session<S> {
 
         if self.lifecycle.state() == ConnectionState::Closed {
             self.stream = None;
+            self.padding_profile = None;
         }
 
         result
@@ -43,6 +47,31 @@ impl<S> Session<S> {
     pub(crate) fn close(&mut self) {
         self.advance(ConnectionEvent::Close)
             .expect("closing a session must always succeed");
+    }
+
+    /// None means no v2 padding profile has been negotiated.
+    pub(crate) fn padding_profile(&self) -> Option<Profile> {
+        self.padding_profile
+    }
+
+    /// Internal negotiation hook, called before VersionAccepted.
+    pub(crate) fn install_padding_profile(&mut self, profile: Profile) -> io::Result<()> {
+        if self.state() != ConnectionState::Negotiating {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "padding profile requires the Negotiating state",
+            ));
+        }
+
+        if self.padding_profile.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "padding profile is already installed",
+            ));
+        }
+
+        self.padding_profile = Some(profile);
+        Ok(())
     }
 }
 
@@ -543,6 +572,112 @@ mod tests {
 
         assert!(!dropped.get());
         assert_eq!(session.state(), ConnectionState::Ready);
+    }
+
+    #[test]
+    fn padding_profile_requires_negotiating_state_and_single_installation() {
+        let mut session = Session::new(stream(Vec::new()));
+
+        assert_eq!(session.padding_profile(), None);
+
+        // Installation before negotiation must fail without installing a profile.
+        let error = session
+            .install_padding_profile(Profile::Block256)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(session.padding_profile(), None);
+
+        session.advance(ConnectionEvent::TlsEstablished).unwrap();
+
+        session.install_padding_profile(Profile::Block256).unwrap();
+
+        assert_eq!(session.padding_profile(), Some(Profile::Block256));
+
+        // A duplicate installation must not replace the original selection.
+        let error = session
+            .install_padding_profile(Profile::Unpadded)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(session.padding_profile(), Some(Profile::Block256));
+
+        for event in [
+            ConnectionEvent::VersionAccepted,
+            ConnectionEvent::ClientAuthenticated,
+            ConnectionEvent::KeyMaterialInstalled,
+            ConnectionEvent::KeysConfirmed,
+        ] {
+            session.advance(event).unwrap();
+
+            assert_eq!(session.padding_profile(), Some(Profile::Block256));
+
+            // Installation must also fail after negotiation has completed.
+            let error = session
+                .install_padding_profile(Profile::Unpadded)
+                .unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(session.padding_profile(), Some(Profile::Block256));
+        }
+
+        assert_eq!(session.state(), ConnectionState::Ready);
+    }
+
+    #[test]
+    fn padding_profile_is_cleared_on_explicit_close() {
+        for profile in [Profile::Unpadded, Profile::Block256] {
+            let transport = stream(Vec::new());
+            let dropped = Rc::clone(&transport.dropped);
+            let mut session = Session::new(transport);
+
+            session.advance(ConnectionEvent::TlsEstablished).unwrap();
+            session.install_padding_profile(profile).unwrap();
+
+            assert_eq!(session.padding_profile(), Some(profile));
+
+            session.close();
+
+            assert_eq!(session.state(), ConnectionState::Closed);
+            assert_eq!(session.padding_profile(), None);
+            assert!(dropped.get());
+
+            // Closing again must remain harmless.
+            session.close();
+
+            assert_eq!(session.state(), ConnectionState::Closed);
+            assert_eq!(session.padding_profile(), None);
+
+            let error = session.install_padding_profile(profile).unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert_eq!(session.padding_profile(), None);
+        }
+    }
+
+    #[test]
+    fn padding_profile_is_cleared_on_invalid_transition() {
+        for profile in [Profile::Unpadded, Profile::Block256] {
+            let transport = stream(Vec::new());
+            let dropped = Rc::clone(&transport.dropped);
+            let mut session = Session::new(transport);
+
+            session.advance(ConnectionEvent::TlsEstablished).unwrap();
+            session.install_padding_profile(profile).unwrap();
+
+            // KeysConfirmed is invalid while still negotiating.
+            assert!(session.advance(ConnectionEvent::KeysConfirmed).is_err());
+
+            assert_eq!(session.state(), ConnectionState::Closed);
+            assert_eq!(session.padding_profile(), None);
+            assert!(dropped.get());
+
+            // An attempted restart must not restore the profile.
+            assert!(session.advance(ConnectionEvent::TlsEstablished).is_err());
+
+            assert_eq!(session.state(), ConnectionState::Closed);
+            assert_eq!(session.padding_profile(), None);
+        }
     }
 }
 

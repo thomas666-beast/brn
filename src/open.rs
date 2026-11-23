@@ -7,6 +7,7 @@ use zeroize::Zeroizing;
 use crate::envelope::{
     AUTH_TAG_LEN, Direction, ENVELOPE_HEADER_LEN, EnvelopeHeader, MessagePurpose,
 };
+use crate::padding::PaddingMode;
 use crate::seal::{MAX_PLAINTEXT_BYTES_PER_KEY, MAX_PLAINTEXT_LEN};
 use crate::sequence::MAX_MESSAGES_PER_KEY;
 
@@ -19,10 +20,22 @@ pub(crate) struct MessageOpener {
     next_sequence: u64,
     plaintext_bytes: u64,
     failed: bool,
+    padding: PaddingMode,
 }
 
 impl MessageOpener {
+    #[cfg(test)]
     pub(crate) fn new(key_bytes: &[u8], direction: Direction) -> io::Result<Self> {
+        Self::new_with_padding(key_bytes, direction, PaddingMode::Disabled)
+    }
+
+    pub(crate) fn new_with_padding(
+        key_bytes: &[u8],
+        direction: Direction,
+        padding: PaddingMode,
+    ) -> io::Result<Self> {
+        padding.encoded_len(0)?;
+
         let key = UnboundKey::new(&AES_256_GCM, key_bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid AES-256-GCM key"))?;
 
@@ -32,6 +45,7 @@ impl MessageOpener {
             next_sequence: 0,
             plaintext_bytes: 0,
             failed: false,
+            padding,
         })
     }
 
@@ -115,7 +129,14 @@ impl MessageOpener {
 
         plaintext.truncate(verified_len);
 
-        // Commit counters only after successful authentication.
+        let plaintext = match header.purpose() {
+            MessagePurpose::KeyConfirmation => plaintext,
+            MessagePurpose::Request | MessagePurpose::Response => self.padding.decode(plaintext)?,
+        };
+
+        // Commit only after authentication and inner-format validation.
+        // next_total counts the complete encrypted plaintext, not merely
+        // the extracted application payload.
         self.next_sequence += 1;
         self.plaintext_bytes = next_total;
 

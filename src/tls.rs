@@ -5,15 +5,35 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 
 pub(crate) const ALPN_PROTOCOL: &[u8] = b"brn/1";
+pub(crate) const ALPN_PROTOCOL_V2: &[u8] = b"brn/2";
 
-/// Builds the initial BRN TLS client configuration.
-///
-/// Each input must contain one DER-encoded trust-anchor certificate.
-///
-/// This configures server verification. It does not establish a
-/// connection or authenticate the BRN client to the server.
+/// Internal selection shared by TLS setup and BRN negotiation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BrnVersion {
+    V1,
+    V2,
+}
+
+impl BrnVersion {
+    pub(crate) fn alpn(self) -> &'static [u8] {
+        match self {
+            Self::V1 => ALPN_PROTOCOL,
+            Self::V2 => ALPN_PROTOCOL_V2,
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn build_client_config(
     trusted_ca_certificates: &[&[u8]],
+) -> Result<ClientConfig, rustls::Error> {
+    build_client_config_for_version(trusted_ca_certificates, BrnVersion::V1)
+}
+
+/// Builds a TLS client configuration offering exactly one BRN version.
+pub(crate) fn build_client_config_for_version(
+    trusted_ca_certificates: &[&[u8]],
+    version: BrnVersion,
 ) -> Result<ClientConfig, rustls::Error> {
     if trusted_ca_certificates.is_empty() {
         return Err(rustls::Error::General(
@@ -34,25 +54,25 @@ pub(crate) fn build_client_config(
         .with_root_certificates(roots)
         .with_no_client_auth();
 
-    config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+    config.alpn_protocols = vec![version.alpn().to_vec()];
     config.enable_early_data = false;
     config.resumption = Resumption::disabled();
 
     Ok(config)
 }
 
-/// Builds the initial BRN TLS server configuration.
-///
-/// Certificates must be DER-encoded and ordered leaf first, followed
-/// by any intermediate certificates. Do not include the root CA.
-///
-/// The private key must be unencrypted PKCS#8 DER.
-///
-/// Client authentication will be handled by the BRN application
-/// handshake, not by TLS client certificates.
 pub(crate) fn build_server_config(
     certificate_chain: &[&[u8]],
     private_key_pkcs8: &[u8],
+) -> Result<ServerConfig, rustls::Error> {
+    build_server_config_for_version(certificate_chain, private_key_pkcs8, BrnVersion::V1)
+}
+
+/// Builds a TLS server configuration offering exactly one BRN version.
+pub(crate) fn build_server_config_for_version(
+    certificate_chain: &[&[u8]],
+    private_key_pkcs8: &[u8],
+    version: BrnVersion,
 ) -> Result<ServerConfig, rustls::Error> {
     if certificate_chain.is_empty() {
         return Err(rustls::Error::General(
@@ -80,7 +100,7 @@ pub(crate) fn build_server_config(
         .with_no_client_auth()
         .with_single_cert(certificates, private_key)?;
 
-    config.alpn_protocols = vec![ALPN_PROTOCOL.to_vec()];
+    config.alpn_protocols = vec![version.alpn().to_vec()];
     config.max_early_data_size = 0;
     config.send_tls13_tickets = 0;
     config.send_half_rtt_data = false;
@@ -178,5 +198,40 @@ mod tests {
         let result = build_server_config(&[certificate.as_slice()], b"not a PKCS#8 private key");
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn versions_map_to_distinct_alpn_identifiers() {
+        assert_eq!(BrnVersion::V1.alpn(), b"brn/1");
+        assert_eq!(BrnVersion::V2.alpn(), b"brn/2");
+        assert_ne!(BrnVersion::V1.alpn(), BrnVersion::V2.alpn());
+    }
+
+    #[test]
+    fn versioned_client_configs_offer_exactly_one_protocol() {
+        let ca = development_file("ca.cert.der");
+
+        for version in [BrnVersion::V1, BrnVersion::V2] {
+            let config = build_client_config_for_version(&[ca.as_slice()], version).unwrap();
+
+            assert_eq!(config.alpn_protocols, vec![version.alpn().to_vec()]);
+            assert!(!config.enable_early_data);
+        }
+    }
+
+    #[test]
+    fn versioned_server_configs_offer_exactly_one_protocol() {
+        let certificate = development_file("server.cert.der");
+        let key = development_file("server.key.der");
+
+        for version in [BrnVersion::V1, BrnVersion::V2] {
+            let config =
+                build_server_config_for_version(&[certificate.as_slice()], &key, version).unwrap();
+
+            assert_eq!(config.alpn_protocols, vec![version.alpn().to_vec()]);
+            assert_eq!(config.max_early_data_size, 0);
+            assert_eq!(config.send_tls13_tickets, 0);
+            assert!(!config.send_half_rtt_data);
+        }
     }
 }

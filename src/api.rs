@@ -6,16 +6,17 @@ use std::time::Duration;
 use aws_lc_rs::rand::SystemRandom;
 
 use crate::auth::{Authenticator, ClientIdentity};
-use crate::client::{ClientTimeouts, ClientTlsStream, connect_tls};
+use crate::client::{ClientTimeouts, ClientTlsStream, connect_tls, connect_tls_for_version};
 use crate::envelope::MessagePurpose;
 use crate::epoch::KeyEpoch;
 use crate::frame::FrameKind;
+use crate::negotiation::v2::Profiles;
 use crate::net::{AcceptedConnection, ConnectionInfo};
 use crate::secure_io::run_encrypted_phase;
-use crate::server::{ServerTimeouts, ServerTlsStream, accept_tls};
+use crate::server::{ServerTimeouts, ServerTlsStream, accept_tls, accept_tls_for_version};
 use crate::session::Session;
 use crate::state::ConnectionState;
-use crate::tls::build_server_config;
+use crate::tls::{BrnVersion, build_server_config};
 use crate::turn::{Exchange, TurnEvent, TurnState};
 
 static APPLICATION_KEY_RNG: OnceLock<SystemRandom> = OnceLock::new();
@@ -31,6 +32,32 @@ pub struct ConnectionTimeouts {
     handshake: Duration,
     negotiation: Duration,
     io: Duration,
+}
+
+/// Padding policy for an explicitly enabled BRN v2 connection.
+///
+/// Existing connection constructors continue using BRN v1.
+/// This policy does not change TLS cryptographic requirements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaddingPolicy {
+    /// Use the v2 handshake but permit only unpadded application bodies.
+    Disabled,
+
+    /// Permit either profile; the server prefers padding when possible.
+    Optional,
+
+    /// Require the Block256 padded application-body format.
+    Required,
+}
+
+impl PaddingPolicy {
+    fn profiles(self) -> Profiles {
+        match self {
+            Self::Disabled => Profiles::UNPADDED_ONLY,
+            Self::Optional => Profiles::BOTH,
+            Self::Required => Profiles::PADDED_ONLY,
+        }
+    }
 }
 
 impl ConnectionTimeouts {
@@ -85,6 +112,37 @@ impl PendingClient {
         Ok(Self { session })
     }
 
+    /// Connects using the BRN v2 application handshake and padding policy.
+    ///
+    /// Both peers must explicitly enable v2.
+    /// Failure does not trigger a retry using BRN v1.
+    ///
+    /// Advertises only the brn/2 TLS ALPN identifier.
+    /// TLS cryptographic settings and certificate verification are unchanged.
+    pub fn connect_with_padding(
+        address: SocketAddr,
+        expected_server_name: &str,
+        trusted_ca_certificates: &[&[u8]],
+        connect_timeout: Duration,
+        timeouts: ConnectionTimeouts,
+        padding: PaddingPolicy,
+    ) -> io::Result<Self> {
+        let client_timeouts =
+            ClientTimeouts::new(connect_timeout, timeouts.handshake, timeouts.io)?;
+
+        let mut session = connect_tls_for_version(
+            address,
+            expected_server_name,
+            trusted_ca_certificates,
+            client_timeouts,
+            BrnVersion::V2,
+        )?;
+
+        session.negotiate_v2_client_with_deadline(padding.profiles(), timeouts.negotiation)?;
+
+        Ok(Self { session })
+    }
+
     /// Sends credentials through the established TLS connection.
     ///
     /// Credentials must contain 1..=4096 bytes.
@@ -115,6 +173,7 @@ impl PendingClient {
 pub struct Server {
     config: Arc<rustls::ServerConfig>,
     timeouts: ConnectionTimeouts,
+    padding_policy: Option<PaddingPolicy>,
 }
 
 impl Server {
@@ -133,6 +192,7 @@ impl Server {
         Ok(Self {
             config: Arc::new(config),
             timeouts,
+            padding_policy: None,
         })
     }
 
@@ -149,9 +209,30 @@ impl Server {
 
         let server_timeouts = ServerTimeouts::new(self.timeouts.handshake, self.timeouts.io)?;
 
-        let mut session = accept_tls(socket, Arc::clone(&self.config), server_timeouts)?;
+        let session = match self.padding_policy {
+            None => {
+                let mut session = accept_tls(socket, Arc::clone(&self.config), server_timeouts)?;
 
-        session.negotiate_server_with_deadline(self.timeouts.negotiation)?;
+                session.negotiate_server_with_deadline(self.timeouts.negotiation)?;
+
+                session
+            }
+            Some(policy) => {
+                let mut session = accept_tls_for_version(
+                    socket,
+                    Arc::clone(&self.config),
+                    server_timeouts,
+                    BrnVersion::V2,
+                )?;
+
+                session.negotiate_v2_server_with_deadline(
+                    policy.profiles(),
+                    self.timeouts.negotiation,
+                )?;
+
+                session
+            }
+        };
 
         Ok(PendingServer {
             session,
@@ -162,6 +243,21 @@ impl Server {
     /// Completes TLS and BRN negotiation on a core-owned connection.
     pub fn accept_connection(&self, connection: AcceptedConnection) -> io::Result<PendingServer> {
         self.accept(connection.into_stream())
+    }
+
+    /// Enables the BRN v2 application handshake for this server.
+    ///
+    /// Advertises only the brn/2 TLS ALPN identifier, including when
+    /// the padding policy permits only unpadded application bodies.
+    ///
+    /// This server configuration will no longer accept v1 connections.
+    /// Use a separate server configuration/listener if both protocol
+    /// versions must be offered.
+    pub fn with_padding(mut self, policy: PaddingPolicy) -> Self {
+        Arc::make_mut(&mut self.config).alpn_protocols = vec![BrnVersion::V2.alpn().to_vec()];
+
+        self.padding_policy = Some(policy);
+        self
     }
 }
 
@@ -359,6 +455,20 @@ impl ReadyClient {
     /// will succeed.
     pub fn is_closed(&self) -> bool {
         self.session.state() == ConnectionState::Closed
+    }
+
+    /// Internal format limit for original request bodies.
+    ///
+    /// Does not perform I/O, check expiration, or reserve key capacity.
+    pub(crate) fn max_request_payload_len(&self) -> io::Result<usize> {
+        if self.session.state() == ConnectionState::Closed {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "BRN session is closed",
+            ));
+        }
+
+        self.epoch.max_application_payload_len()
     }
 }
 
@@ -633,6 +743,37 @@ mod tests {
                     if message == "at least one trusted CA certificate is required"
             ),
             "unexpected underlying error: {tls_error:?}"
+        );
+    }
+
+    #[test]
+    fn padding_policy_maps_to_expected_profiles() {
+        use crate::negotiation::v2::Profile;
+
+        let disabled = PaddingPolicy::Disabled.profiles();
+        assert!(disabled.contains(Profile::Unpadded));
+        assert!(!disabled.contains(Profile::Block256));
+
+        let optional = PaddingPolicy::Optional.profiles();
+        assert!(optional.contains(Profile::Unpadded));
+        assert!(optional.contains(Profile::Block256));
+
+        let required = PaddingPolicy::Required.profiles();
+        assert!(!required.contains(Profile::Unpadded));
+        assert!(required.contains(Profile::Block256));
+    }
+
+    #[test]
+    fn required_padding_cannot_select_unpadded() {
+        use crate::negotiation::v2::Profile;
+
+        let required = PaddingPolicy::Required.profiles();
+
+        assert!(required.select(PaddingPolicy::Disabled.profiles()).is_err());
+
+        assert_eq!(
+            required.select(PaddingPolicy::Optional.profiles()).unwrap(),
+            Profile::Block256
         );
     }
 }

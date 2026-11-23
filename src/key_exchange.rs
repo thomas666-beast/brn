@@ -8,9 +8,13 @@ use crate::epoch::KeyEpoch;
 use crate::frame::FrameKind;
 use crate::key_wire::KeyOffer;
 use crate::keys::TemporaryKeys;
+use crate::padding::PaddingMode;
 use crate::phase::PhaseDeadline;
 use crate::session::Session;
 use crate::state::{ConnectionEvent, ConnectionState};
+
+#[cfg(test)]
+use crate::negotiation::v2::Profile;
 
 const CLIENT_CONFIRMATION: &[u8] = b"BRN client key confirmation v1";
 const SERVER_CONFIRMATION: &[u8] = b"BRN server key confirmation v1";
@@ -33,7 +37,12 @@ impl<S: Read + Write + PhaseDeadline> Session<S> {
                 KeyOffer::decode(frame.body())?
             };
 
-            let mut epoch = KeyEpoch::for_client(keys)?;
+            let padding = session
+                .padding_profile()
+                .map(PaddingMode::from)
+                .unwrap_or(PaddingMode::Disabled);
+
+            let mut epoch = KeyEpoch::for_client_with_padding(keys, padding)?;
 
             session
                 .advance(ConnectionEvent::KeyMaterialInstalled)
@@ -67,7 +76,13 @@ impl<S: Read + Write + PhaseDeadline> Session<S> {
 
             let keys = TemporaryKeys::generate(rng)?;
             let offer = KeyOffer::from_keys(&keys);
-            let mut epoch = KeyEpoch::for_server(keys)?;
+
+            let padding = session
+                .padding_profile()
+                .map(PaddingMode::from)
+                .unwrap_or(PaddingMode::Disabled);
+
+            let mut epoch = KeyEpoch::for_server_with_padding(keys, padding)?;
 
             session.send(FrameKind::Control, offer.body())?;
 
@@ -292,6 +307,56 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
         assert_eq!(session.state(), ConnectionState::Closed);
+    }
+
+    #[test]
+    fn client_key_establishment_uses_installed_block256_profile() {
+        let mut session = Session::new(TestStream {
+            input: Cursor::new(server_messages(SERVER_CONFIRMATION, false)),
+            output: Vec::new(),
+        });
+
+        session.advance(ConnectionEvent::TlsEstablished).unwrap();
+
+        assert_eq!(session.state(), ConnectionState::Negotiating);
+
+        session.install_padding_profile(Profile::Block256).unwrap();
+
+        for event in [
+            ConnectionEvent::VersionAccepted,
+            ConnectionEvent::ClientAuthenticated,
+        ] {
+            session.advance(event).unwrap();
+        }
+
+        let mut epoch = session
+            .establish_client_keys(Duration::from_secs(1))
+            .unwrap();
+
+        assert_eq!(session.state(), ConnectionState::Ready);
+
+        let payload = b"first request";
+        let request = epoch.seal(MessagePurpose::Request, payload).unwrap();
+
+        assert_eq!(request.sequence(), 1);
+
+        let mut unpadded_session = self::session(server_messages(SERVER_CONFIRMATION, false));
+
+        let mut unpadded_epoch = unpadded_session
+            .establish_client_keys(Duration::from_secs(1))
+            .unwrap();
+
+        let unpadded_request = unpadded_epoch
+            .seal(MessagePurpose::Request, payload)
+            .unwrap();
+
+        assert_eq!(unpadded_request.sequence(), 1);
+
+        assert_eq!(
+            request.body().len(),
+            unpadded_request.body().len() - payload.len() + 256,
+            "the returned epoch must encode the small request in a 256-byte bucket",
+        );
     }
 }
 

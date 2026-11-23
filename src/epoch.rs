@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 use crate::envelope::{Direction, MessagePurpose};
 use crate::keys::TemporaryKeys;
 use crate::open::{MessageOpener, OpenedMessage};
+use crate::padding::PaddingMode;
 use crate::seal::{MessageSealer, SealedMessage};
 
 pub(crate) const KEY_LIFETIME: Duration = Duration::from_secs(15 * 60);
@@ -35,15 +36,41 @@ pub(crate) struct KeyEpoch {
 }
 
 impl KeyEpoch {
+    #[cfg(test)]
     pub(crate) fn for_client(keys: TemporaryKeys) -> io::Result<Self> {
         Self::new_at(keys, EndpointRole::Client, Instant::now())
     }
 
+    #[cfg(test)]
     pub(crate) fn for_server(keys: TemporaryKeys) -> io::Result<Self> {
         Self::new_at(keys, EndpointRole::Server, Instant::now())
     }
 
+    pub(crate) fn for_client_with_padding(
+        keys: TemporaryKeys,
+        padding: PaddingMode,
+    ) -> io::Result<Self> {
+        Self::new_at_with_padding(keys, EndpointRole::Client, Instant::now(), padding)
+    }
+
+    pub(crate) fn for_server_with_padding(
+        keys: TemporaryKeys,
+        padding: PaddingMode,
+    ) -> io::Result<Self> {
+        Self::new_at_with_padding(keys, EndpointRole::Server, Instant::now(), padding)
+    }
+
+    #[cfg(test)]
     fn new_at(keys: TemporaryKeys, role: EndpointRole, now: Instant) -> io::Result<Self> {
+        Self::new_at_with_padding(keys, role, now, PaddingMode::Disabled)
+    }
+
+    fn new_at_with_padding(
+        keys: TemporaryKeys,
+        role: EndpointRole,
+        now: Instant,
+        padding: PaddingMode,
+    ) -> io::Result<Self> {
         let expires_at = now.checked_add(KEY_LIFETIME).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -53,16 +80,31 @@ impl KeyEpoch {
 
         let (sender, receiver) = match role {
             EndpointRole::Client => (
-                MessageSealer::new(keys.client_to_server(), Direction::ClientToServer)?,
-                MessageOpener::new(keys.server_to_client(), Direction::ServerToClient)?,
+                MessageSealer::new_with_padding(
+                    keys.client_to_server(),
+                    Direction::ClientToServer,
+                    padding,
+                )?,
+                MessageOpener::new_with_padding(
+                    keys.server_to_client(),
+                    Direction::ServerToClient,
+                    padding,
+                )?,
             ),
             EndpointRole::Server => (
-                MessageSealer::new(keys.server_to_client(), Direction::ServerToClient)?,
-                MessageOpener::new(keys.client_to_server(), Direction::ClientToServer)?,
+                MessageSealer::new_with_padding(
+                    keys.server_to_client(),
+                    Direction::ServerToClient,
+                    padding,
+                )?,
+                MessageOpener::new_with_padding(
+                    keys.client_to_server(),
+                    Direction::ClientToServer,
+                    padding,
+                )?,
             ),
         };
 
-        // TemporaryKeys drops its raw storage after construction.
         Ok(Self {
             keys: Some(EpochKeys { sender, receiver }),
             expires_at,
@@ -172,6 +214,17 @@ impl KeyEpoch {
         };
 
         Ok(requested.min(remaining))
+    }
+
+    /// Reports the sender's application-body format limit.
+    ///
+    /// Does not reserve capacity or check expiration.
+    pub(crate) fn max_application_payload_len(&self) -> io::Result<usize> {
+        self.keys
+            .as_ref()
+            .ok_or_else(disabled_error)?
+            .sender
+            .max_application_payload_len()
     }
 }
 
@@ -946,23 +999,196 @@ mod tests {
         assert!(client.verify_live().is_ok());
         assert!(server.verify_live().is_ok());
     }
+
+    #[test]
+    fn padded_epoch_round_trips_and_counts_encoded_bytes() {
+        let mode = PaddingMode::block(256).unwrap();
+
+        let mut client = KeyEpoch::for_client_with_padding(material(), mode).unwrap();
+        let mut server = KeyEpoch::for_server_with_padding(material(), mode).unwrap();
+
+        let before = client.capacity().unwrap();
+
+        let request = client.seal(MessagePurpose::Request, b"hello man").unwrap();
+
+        assert_eq!(
+            request.body().len(),
+            crate::envelope::ENVELOPE_HEADER_LEN + 256 + crate::envelope::AUTH_TAG_LEN
+        );
+
+        let opened = server
+            .open(request.body(), MessagePurpose::Request)
+            .unwrap();
+
+        assert_eq!(opened.body(), b"hello man");
+
+        let client_after = client.capacity().unwrap();
+        let server_after = server.capacity().unwrap();
+
+        assert_eq!(
+            client_after.send_plaintext_bytes,
+            before.send_plaintext_bytes - 256
+        );
+        assert_eq!(
+            server_after.receive_plaintext_bytes,
+            client_after.send_plaintext_bytes
+        );
+
+        let response = server
+            .seal(MessagePurpose::Response, &[0, 255, 0, 17])
+            .unwrap();
+
+        let opened = client
+            .open(response.body(), MessagePurpose::Response)
+            .unwrap();
+
+        assert_eq!(opened.body(), &[0, 255, 0, 17]);
+    }
+
+    #[test]
+    fn padded_epoch_keeps_confirmation_representation_unchanged() {
+        let mode = PaddingMode::block(256).unwrap();
+
+        let mut client = KeyEpoch::for_client_with_padding(material(), mode).unwrap();
+        let mut server = KeyEpoch::for_server_with_padding(material(), mode).unwrap();
+
+        let confirmation = client
+            .seal(MessagePurpose::KeyConfirmation, b"confirm")
+            .unwrap();
+
+        assert_eq!(
+            confirmation.body().len(),
+            crate::envelope::ENVELOPE_HEADER_LEN + b"confirm".len() + crate::envelope::AUTH_TAG_LEN
+        );
+
+        let opened = server
+            .open(confirmation.body(), MessagePurpose::KeyConfirmation)
+            .unwrap();
+
+        assert_eq!(opened.body(), b"confirm");
+
+        let request = client
+            .seal(MessagePurpose::Request, b"after confirmation")
+            .unwrap();
+
+        assert_eq!(request.sequence(), 1);
+
+        let opened = server
+            .open(request.body(), MessagePurpose::Request)
+            .unwrap();
+
+        assert_eq!(opened.body(), b"after confirmation");
+    }
+
+    #[test]
+    fn authenticated_invalid_padding_disables_both_epoch_directions() {
+        let mode = PaddingMode::block(256).unwrap();
+
+        // Unpadded sender deliberately constructs a malformed inner
+        // representation, then authenticates it with the valid test key.
+        let mut source = KeyEpoch::for_client(material()).unwrap();
+        let mut receiver = KeyEpoch::for_server_with_padding(material(), mode).unwrap();
+
+        let mut malformed = mode.encode(b"hello").unwrap();
+        *malformed.last_mut().unwrap() = 1;
+
+        let sealed = source
+            .seal(MessagePurpose::Request, malformed.as_slice())
+            .unwrap();
+
+        assert!(
+            receiver
+                .open(sealed.body(), MessagePurpose::Request)
+                .is_err()
+        );
+
+        assert!(receiver.keys.is_none());
+        assert!(receiver.verify_live().is_err());
+        assert!(
+            receiver
+                .seal(MessagePurpose::Response, b"must fail")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn padded_epoch_preserves_payloads_at_bucket_boundaries() {
+        let mode = PaddingMode::block(256).unwrap();
+
+        let mut client = KeyEpoch::for_client_with_padding(material(), mode).unwrap();
+        let mut server = KeyEpoch::for_server_with_padding(material(), mode).unwrap();
+
+        let overhead = crate::envelope::ENVELOPE_HEADER_LEN + crate::envelope::AUTH_TAG_LEN;
+
+        // Four bytes of inner length metadata precede each payload.
+        let cases = [
+            (0usize, 256usize),
+            (251, 256),
+            (252, 256),
+            (253, 512),
+            (507, 512),
+            (508, 512),
+            (509, 768),
+            (61_436, 61_440),
+        ];
+
+        for (index, (payload_len, encoded_len)) in cases.into_iter().enumerate() {
+            let payload: Vec<u8> = (0..payload_len).map(|i| (i % 256) as u8).collect();
+
+            let request = client.seal(MessagePurpose::Request, &payload).unwrap();
+
+            assert_eq!(request.sequence(), index as u64);
+            assert_eq!(
+                request.body().len(),
+                overhead + encoded_len,
+                "wrong request bucket for payload length {payload_len}",
+            );
+
+            let opened = server
+                .open(request.body(), MessagePurpose::Request)
+                .unwrap();
+
+            assert_eq!(
+                opened.body(),
+                payload.as_slice(),
+                "request changed at payload length {payload_len}",
+            );
+
+            let response = server.seal(MessagePurpose::Response, &payload).unwrap();
+
+            assert_eq!(response.sequence(), index as u64);
+            assert_eq!(
+                response.body().len(),
+                overhead + encoded_len,
+                "wrong response bucket for payload length {payload_len}",
+            );
+
+            let opened = client
+                .open(response.body(), MessagePurpose::Response)
+                .unwrap();
+
+            assert_eq!(
+                opened.body(),
+                payload.as_slice(),
+                "response changed at payload length {payload_len}",
+            );
+        }
+    }
 }
 
 #[cfg(test)]
 #[path = "epoch_adversarial_tests.rs"]
 mod adversarial_tests;
 
-/// Local snapshot of an application-key epoch's remaining capacity.
+/// Byte budgets count the complete plaintext passed to application
+/// encryption, including application protocol metadata, key-confirmation
+/// plaintext, and any inner padding-format metadata and padding.
 ///
-/// Sending and receiving are relative to the endpoint reporting it.
+/// They do not count TLS bytes, ciphertext authentication tags, or outer
+/// frame headers.
 ///
-/// Byte budgets count application plaintext, including application
-/// protocol metadata and key-confirmation plaintext. They do not count
-/// TLS bytes, ciphertext authentication tags, or outer frame headers.
-///
-/// This snapshot reserves nothing. Time and later operations may
-/// invalidate it. It does not report the peer's remaining lifetime
-/// or guarantee that the next operation will succeed.
+/// With padding enabled, remaining plaintext bytes are not the same as
+/// the remaining capacity for original application payload bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApplicationKeyCapacity {
     pub send_plaintext_bytes: u64,

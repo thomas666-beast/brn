@@ -7,6 +7,7 @@ use zeroize::Zeroizing;
 use crate::envelope::{
     AUTH_TAG_LEN, Direction, ENVELOPE_HEADER_LEN, EnvelopeHeader, MessagePurpose,
 };
+use crate::padding::PaddingMode;
 use crate::sequence::SendSequence;
 
 pub(crate) const MAX_PLAINTEXT_LEN: usize = 60 * 1024;
@@ -28,10 +29,23 @@ pub(crate) struct MessageSealer {
     sequence: SendSequence,
     plaintext_bytes: u64,
     exhausted: bool,
+    padding: PaddingMode,
 }
 
 impl MessageSealer {
+    #[cfg(test)]
     pub(crate) fn new(key_bytes: &[u8], direction: Direction) -> io::Result<Self> {
+        Self::new_with_padding(key_bytes, direction, PaddingMode::Disabled)
+    }
+
+    pub(crate) fn new_with_padding(
+        key_bytes: &[u8],
+        direction: Direction,
+        padding: PaddingMode,
+    ) -> io::Result<Self> {
+        // Validate configuration before accepting it.
+        padding.encoded_len(0)?;
+
         let key = UnboundKey::new(&AES_256_GCM, key_bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid AES-256-GCM key"))?;
 
@@ -41,9 +55,9 @@ impl MessageSealer {
             sequence: SendSequence::new(),
             plaintext_bytes: 0,
             exhausted: false,
+            padding,
         })
     }
-
     /// Returns a complete encrypted-frame body:
     ///
     /// envelope header || ciphertext || authentication tag
@@ -69,6 +83,21 @@ impl MessageSealer {
         // Validate direction/purpose before consuming a sequence.
         EnvelopeHeader::new(self.direction, purpose, 0)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+
+        // Confirmation retains its existing representation.
+        // Request/response bodies use the negotiated padding mode.
+        let padded_plaintext = match purpose {
+            MessagePurpose::KeyConfirmation => None,
+            MessagePurpose::Request | MessagePurpose::Response => match self.padding {
+                PaddingMode::Disabled => None,
+                _ => Some(self.padding.encode(plaintext)?),
+            },
+        };
+
+        let plaintext = match padded_plaintext.as_ref() {
+            Some(encoded) => encoded.as_slice(),
+            None => plaintext,
+        };
 
         let next_total = match self.plaintext_bytes.checked_add(plaintext.len() as u64) {
             Some(total) if total <= MAX_PLAINTEXT_BYTES_PER_KEY => total,
@@ -124,6 +153,13 @@ impl MessageSealer {
                 Err(error)
             }
         }
+    }
+
+    /// Maximum original request/response body for this sender's format.
+    ///
+    /// This is a format limit, not remaining key capacity.
+    pub(crate) fn max_application_payload_len(&self) -> io::Result<usize> {
+        self.padding.max_payload_len()
     }
 }
 

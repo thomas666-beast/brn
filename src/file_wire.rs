@@ -30,6 +30,18 @@ const CHUNK_HEADER_LEN: usize = BASE_LEN + ID_LEN + OFFSET_LEN;
 pub(crate) const MAX_CHUNK_LEN: usize = MAX_PLAINTEXT_LEN.saturating_sub(CHUNK_HEADER_LEN);
 const _: () = assert!(MAX_CHUNK_LEN > 0);
 
+/// Maximum file data fitting a connection's original application-body limit.
+///
+/// The wire-level maximum remains unchanged.
+pub(crate) fn max_chunk_len_for_payload_limit(payload_limit: usize) -> io::Result<usize> {
+    payload_limit
+        .min(MAX_PLAINTEXT_LEN)
+        .checked_sub(CHUNK_HEADER_LEN)
+        .filter(|length| *length > 0)
+        .map(|length| length.min(MAX_CHUNK_LEN))
+        .ok_or_else(|| invalid("connection payload limit cannot fit a file chunk"))
+}
+
 /// Opaque upload identifier.
 ///
 /// An ID identifies an upload; it does not authorize access.
@@ -846,5 +858,45 @@ mod verification_response_tests {
             UploadResponse::Verifying { id: decoded_id }
                 if decoded_id == id
         ));
+    }
+
+    #[test]
+    fn connection_chunk_limit_respects_padding_and_wire_metadata() {
+        let mode = crate::padding::PaddingMode::block(256).unwrap();
+        let upload_id = UploadId([0x42; 16]);
+
+        assert_eq!(
+            max_chunk_len_for_payload_limit(MAX_PLAINTEXT_LEN).unwrap(),
+            MAX_CHUNK_LEN
+        );
+
+        let chunk_len = max_chunk_len_for_payload_limit(mode.max_payload_len().unwrap()).unwrap();
+
+        assert_eq!(chunk_len, 61_406);
+
+        let bytes = vec![0x5a; chunk_len];
+        let encoded = UploadRequest::Chunk {
+            id: upload_id,
+            offset: 0,
+            bytes: &bytes,
+        }
+        .encode()
+        .unwrap();
+
+        assert_eq!(encoded.len(), 61_436);
+        assert_eq!(mode.encoded_len(encoded.len()).unwrap(), 61_440);
+
+        let oversized = vec![0x5a; chunk_len + 1];
+        let encoded = UploadRequest::Chunk {
+            id: upload_id,
+            offset: 0,
+            bytes: &oversized,
+        }
+        .encode()
+        .unwrap();
+
+        assert!(mode.encoded_len(encoded.len()).is_err());
+
+        assert!(max_chunk_len_for_payload_limit(CHUNK_HEADER_LEN).is_err());
     }
 }

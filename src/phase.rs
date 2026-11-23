@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use rustls::{ClientConnection, ServerConnection, StreamOwned};
 
+use crate::negotiation::v2::Profiles;
 use crate::session::Session;
 use crate::transport::DeadlineTcpStream;
 
@@ -39,6 +40,22 @@ impl<S: Read + Write + PhaseDeadline> Session<S> {
 
     pub(crate) fn negotiate_server_with_deadline(&mut self, budget: Duration) -> io::Result<()> {
         self.run_phase(budget, |session| session.negotiate_as_server())
+    }
+
+    pub(crate) fn negotiate_v2_client_with_deadline(
+        &mut self,
+        supported: Profiles,
+        budget: Duration,
+    ) -> io::Result<()> {
+        self.run_phase(budget, |session| session.negotiate_v2_as_client(supported))
+    }
+
+    pub(crate) fn negotiate_v2_server_with_deadline(
+        &mut self,
+        allowed: Profiles,
+        budget: Duration,
+    ) -> io::Result<()> {
+        self.run_phase(budget, |session| session.negotiate_v2_as_server(allowed))
     }
 }
 

@@ -145,6 +145,28 @@ fn connect(
     .establish_keys(OPERATION_BUDGET)
 }
 
+fn connect_upload_case(
+    address: SocketAddr,
+    ca: &[u8],
+    timeouts: ConnectionTimeouts,
+    padded: bool,
+) -> io::Result<ReadyClient> {
+    if !padded {
+        return connect(address, ca, timeouts);
+    }
+
+    PendingClient::connect_with_padding(
+        address,
+        "localhost",
+        &[ca],
+        Duration::from_secs(2),
+        timeouts,
+        crate::api::PaddingPolicy::Required,
+    )?
+    .authenticate(b"file-transfer-loopback-test", OPERATION_BUDGET)?
+    .establish_keys(OPERATION_BUDGET)
+}
+
 fn ensure(condition: bool, message: &'static str) -> io::Result<()> {
     if !condition {
         return Err(io::Error::other(message));
@@ -168,6 +190,10 @@ fn stored_path(root: &Path, upload_id: [u8; 16]) -> PathBuf {
 }
 
 fn run_upload_case(reconnect: bool) -> io::Result<()> {
+    run_upload_case_with_padding(reconnect, false)
+}
+
+fn run_upload_case_with_padding(reconnect: bool, padded: bool) -> io::Result<()> {
     let directory = TestDirectory::new()?;
 
     let length = MAX_FILE_CHUNK_LEN
@@ -185,6 +211,12 @@ fn run_upload_case(reconnect: bool) -> io::Result<()> {
     let timeouts = connection_timeouts()?;
 
     let server = Server::new(&[certificate.as_slice()], &private_key, timeouts)?;
+
+    let server = if padded {
+        server.with_padding(crate::api::PaddingPolicy::Required)
+    } else {
+        server
+    };
 
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
@@ -244,15 +276,21 @@ fn run_upload_case(reconnect: bool) -> io::Result<()> {
     let client_result = (|| -> io::Result<[u8; 16]> {
         let mut source = FileUploadSource::open(directory.source(), expected_size)?;
 
-        let connection = connect(address, &ca, timeouts)?;
+        let connection = connect_upload_case(address, &ca, timeouts, padded)?;
 
         let (mut connection, upload) = source.begin(connection, OPERATION_BUDGET)?;
 
         let (next, mut offset) = source.send_next(&upload, connection, 0, OPERATION_BUDGET)?;
         connection = next;
 
+        let expected_first_chunk = if padded {
+            61_406_u64
+        } else {
+            MAX_FILE_CHUNK_LEN as u64
+        };
+
         ensure(
-            offset == MAX_FILE_CHUNK_LEN as u64,
+            offset == expected_first_chunk,
             "first chunk acknowledgement had an unexpected offset",
         )?;
 
@@ -261,7 +299,7 @@ fn run_upload_case(reconnect: bool) -> io::Result<()> {
             // chunk. The upload service remains alive on the server.
             connection.close();
 
-            let fresh = connect(address, &ca, timeouts)?;
+            let fresh = connect_upload_case(address, &ca, timeouts, padded)?;
 
             let (next, status) = upload.status(fresh, OPERATION_BUDGET)?;
             connection = next;
@@ -394,7 +432,18 @@ fn finish_and_wait(
 
 #[test]
 fn public_file_upload_recovers_after_lost_chunk_acknowledgement() -> io::Result<()> {
+    run_lost_chunk_ack_case(false)
+}
+
+#[test]
+fn padded_file_upload_recovers_after_lost_chunk_acknowledgement() -> io::Result<()> {
+    run_lost_chunk_ack_case(true)
+}
+
+fn run_lost_chunk_ack_case(padded: bool) -> io::Result<()> {
     use crate::file_wire::{UploadRequest, UploadResponse};
+
+    let expected_chunk_len: usize = if padded { 61_406 } else { MAX_FILE_CHUNK_LEN };
 
     let directory = TestDirectory::new()?;
 
@@ -412,6 +461,12 @@ fn public_file_upload_recovers_after_lost_chunk_acknowledgement() -> io::Result<
     let timeouts = connection_timeouts()?;
 
     let server = Server::new(&[certificate.as_slice()], &private_key, timeouts)?;
+
+    let server = if padded {
+        server.with_padding(crate::api::PaddingPolicy::Required)
+    } else {
+        server
+    };
 
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
@@ -450,7 +505,7 @@ fn public_file_upload_recovers_after_lost_chunk_acknowledgement() -> io::Result<
                 id,
                 offset: 0,
                 bytes,
-            } if bytes.len() == MAX_FILE_CHUNK_LEN => id,
+            } if bytes.len() == expected_chunk_len => id,
             _ => {
                 return Err(io::Error::other("expected the first full upload chunk"));
             }
@@ -464,7 +519,7 @@ fn public_file_upload_recovers_after_lost_chunk_acknowledgement() -> io::Result<
             UploadResponse::Progress {
                 id: returned_id,
                 offset,
-            } if returned_id == id && offset == MAX_FILE_CHUNK_LEN as u64 => {}
+            } if returned_id == id && offset == expected_chunk_len as u64 => {}
             _ => {
                 return Err(io::Error::other(
                     "server did not confirm storage of the first chunk",
@@ -511,7 +566,7 @@ fn public_file_upload_recovers_after_lost_chunk_acknowledgement() -> io::Result<
     let client_result = (|| -> io::Result<[u8; 16]> {
         let mut source = FileUploadSource::open(directory.source(), expected_size)?;
 
-        let connection = connect(address, &ca, timeouts)?;
+        let connection = connect_upload_case(address, &ca, timeouts, padded)?;
 
         let (connection, upload) = source.begin(connection, OPERATION_BUDGET)?;
 
@@ -530,14 +585,14 @@ fn public_file_upload_recovers_after_lost_chunk_acknowledgement() -> io::Result<
             }
         }
 
-        let connection = connect(address, &ca, timeouts)?;
+        let connection = connect_upload_case(address, &ca, timeouts, padded)?;
 
         let (mut connection, status) = upload.status(connection, OPERATION_BUDGET)?;
 
         let mut offset = match status {
             FileUploadStatus::Receiving { confirmed_offset } => {
                 ensure(
-                    confirmed_offset == MAX_FILE_CHUNK_LEN as u64,
+                    confirmed_offset == expected_chunk_len as u64,
                     "lost-ack recovery returned an unexpected offset",
                 )?;
 
@@ -569,6 +624,14 @@ fn public_file_upload_recovers_after_lost_chunk_acknowledgement() -> io::Result<
     let server_result = server_thread
         .join()
         .map_err(|_| io::Error::other("lost-ack test server panicked"))?;
+
+    if let Err(error) = &client_result {
+        eprintln!("lost-ack client failed (padded={padded}): {error:?}");
+    }
+
+    if let Err(error) = &server_result {
+        eprintln!("lost-ack server failed (padded={padded}): {error:?}");
+    }
 
     let upload_id = client_result?;
     let (count, reserved) = server_result?;
@@ -607,6 +670,14 @@ fn run_rotating_upload_case_with_capacity(
     max_exchanges: u64,
     restriction: Option<CapacityRestriction>,
 ) -> io::Result<()> {
+    run_rotating_upload_case_with_padding(max_exchanges, restriction, false)
+}
+
+fn run_rotating_upload_case_with_padding(
+    max_exchanges: u64,
+    restriction: Option<CapacityRestriction>,
+    padded: bool,
+) -> io::Result<()> {
     use std::cell::Cell;
     use std::sync::mpsc::{self, TryRecvError};
 
@@ -634,6 +705,12 @@ fn run_rotating_upload_case_with_capacity(
     let timeouts = connection_timeouts()?;
 
     let server = Server::new(&[certificate.as_slice()], &private_key, timeouts)?;
+
+    let server = if padded {
+        server.with_padding(crate::api::PaddingPolicy::Required)
+    } else {
+        server
+    };
 
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
@@ -727,7 +804,8 @@ fn run_rotating_upload_case_with_capacity(
 
         let mut transfer = FileUploadConnection::new(
             || {
-                let connection = connect(address, &ca, timeouts)?;
+                let connection = connect_upload_case(address, &ca, timeouts, padded)?;
+
                 connected.set(connected.get() + 1);
                 Ok(connection)
             },
@@ -1085,6 +1163,7 @@ fn public_file_upload_large_disk_backed() -> io::Result<()> {
         let mut transfer = FileUploadConnection::new(
             || {
                 let connection = connect(address, &ca, timeouts)?;
+
                 connected.set(connected.get() + 1);
                 Ok(connection)
             },
@@ -1232,4 +1311,435 @@ fn public_file_upload_large_disk_backed() -> io::Result<()> {
     );
 
     verify_pattern_file(&stored_path(&directory.uploads(), upload_id), size)
+}
+
+// Core padding tests. Reuse this module's TLS/authentication fixtures;
+// do not change the existing file-transfer tests.
+
+fn padding_test_payloads() -> Vec<Vec<u8>> {
+    let mut payloads = vec![
+        Vec::new(),
+        b"hello man".to_vec(),
+        "Text with Unicode: café, Ελληνικά".as_bytes().to_vec(),
+        vec![0, 255, 0, 17, 128, 0],
+    ];
+
+    // Four bytes of inner length metadata mean the first transition
+    // occurs between original payload lengths 252 and 253.
+    for length in [1usize, 251, 252, 253, 255, 256, 257, 507, 508, 509] {
+        payloads.push((0..length).map(|index| (index % 256) as u8).collect());
+    }
+
+    payloads
+}
+
+fn expected_padding_test_bytes(length: usize, padded: bool) -> u64 {
+    if padded {
+        ((length + 4).div_ceil(256) * 256) as u64
+    } else {
+        length as u64
+    }
+}
+
+fn run_padding_loopback_case(
+    client_policy: Option<crate::api::PaddingPolicy>,
+    server_policy: Option<crate::api::PaddingPolicy>,
+    expected_padded: Option<bool>,
+) -> io::Result<()> {
+    let ca = fixture("ca.cert.der")?;
+    let certificate = fixture("server.cert.der")?;
+    let private_key = fixture("server.key.der")?;
+    let timeouts = connection_timeouts()?;
+
+    let server = Server::new(&[certificate.as_slice()], &private_key, timeouts)?;
+
+    let server = match server_policy {
+        Some(policy) => server.with_padding(policy),
+        None => server,
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+
+    let server_thread = thread::spawn(move || -> io::Result<()> {
+        let socket = accept_with_timeout(&listener)?;
+        let pending = server.accept(socket);
+
+        let Some(padded) = expected_padded else {
+            return match pending {
+                Err(_) => Ok(()),
+                Ok(connection) => {
+                    connection.close();
+                    Err(io::Error::other(
+                        "server unexpectedly accepted incompatible negotiation",
+                    ))
+                }
+            };
+        };
+
+        let mut connection = pending?
+            .authenticate(&TestAuthenticator, OPERATION_BUDGET)?
+            .establish_keys(OPERATION_BUDGET)?;
+
+        for expected in padding_test_payloads() {
+            let before = connection.application_key_capacity()?;
+
+            let received = connection.receive_request(OPERATION_BUDGET)?;
+
+            ensure(
+                received == expected,
+                "server received altered application bytes",
+            )?;
+
+            connection.respond(&received, OPERATION_BUDGET)?;
+
+            let after = connection.application_key_capacity()?;
+            let consumed = expected_padding_test_bytes(expected.len(), padded);
+
+            ensure(
+                before
+                    .receive_plaintext_bytes
+                    .checked_sub(after.receive_plaintext_bytes)
+                    == Some(consumed),
+                "server receive accounting does not match selected format",
+            )?;
+
+            ensure(
+                before
+                    .send_plaintext_bytes
+                    .checked_sub(after.send_plaintext_bytes)
+                    == Some(consumed),
+                "server send accounting does not match selected format",
+            )?;
+        }
+
+        connection.close();
+        Ok(())
+    });
+
+    // Capture the result before joining so client-side errors do not
+    // return early and leave the server thread unjoined.
+    let client_result = (|| -> io::Result<()> {
+        let pending = match client_policy {
+            None => PendingClient::connect(
+                address,
+                "localhost",
+                &[ca.as_slice()],
+                Duration::from_secs(2),
+                timeouts,
+            ),
+            Some(policy) => PendingClient::connect_with_padding(
+                address,
+                "localhost",
+                &[ca.as_slice()],
+                Duration::from_secs(2),
+                timeouts,
+                policy,
+            ),
+        };
+
+        let Some(padded) = expected_padded else {
+            return match pending {
+                Err(_) => Ok(()),
+                Ok(connection) => {
+                    connection.close();
+                    Err(io::Error::other(
+                        "client unexpectedly accepted incompatible negotiation",
+                    ))
+                }
+            };
+        };
+
+        let mut connection = pending?
+            .authenticate(b"file-transfer-loopback-test", OPERATION_BUDGET)?
+            .establish_keys(OPERATION_BUDGET)?;
+
+        for payload in padding_test_payloads() {
+            let before = connection.application_key_capacity()?;
+
+            let response = connection.request(&payload, OPERATION_BUDGET)?;
+
+            ensure(
+                response == payload,
+                "client received altered application bytes",
+            )?;
+
+            let after = connection.application_key_capacity()?;
+            let consumed = expected_padding_test_bytes(payload.len(), padded);
+
+            ensure(
+                before
+                    .send_plaintext_bytes
+                    .checked_sub(after.send_plaintext_bytes)
+                    == Some(consumed),
+                "client send accounting does not match selected format",
+            )?;
+
+            ensure(
+                before
+                    .receive_plaintext_bytes
+                    .checked_sub(after.receive_plaintext_bytes)
+                    == Some(consumed),
+                "client receive accounting does not match selected format",
+            )?;
+        }
+
+        connection.close();
+        Ok(())
+    })();
+
+    let server_result = server_thread
+        .join()
+        .map_err(|_| io::Error::other("padding test server panicked"))?;
+
+    // Both sides have finished before either result is propagated.
+    client_result?;
+    server_result
+}
+
+#[test]
+fn core_padding_legacy_v1_round_trip() -> io::Result<()> {
+    run_padding_loopback_case(None, None, Some(false))
+}
+
+#[test]
+fn core_padding_compatible_v2_policy_matrix() -> io::Result<()> {
+    use crate::api::PaddingPolicy::{Disabled, Optional, Required};
+
+    let cases = [
+        (Disabled, Disabled, false),
+        (Disabled, Optional, false),
+        (Optional, Disabled, false),
+        (Optional, Optional, true),
+        (Optional, Required, true),
+        (Required, Optional, true),
+        (Required, Required, true),
+    ];
+
+    for (client, server, padded) in cases {
+        run_padding_loopback_case(Some(client), Some(server), Some(padded)).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("client={client:?}, server={server:?}: {error}"),
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+#[test]
+fn core_padding_incompatible_v2_policies_rejected() -> io::Result<()> {
+    use crate::api::PaddingPolicy::{Disabled, Required};
+
+    for (client, server) in [(Required, Disabled), (Disabled, Required)] {
+        run_padding_loopback_case(Some(client), Some(server), None)?;
+    }
+
+    Ok(())
+}
+
+#[test]
+fn core_padding_mixed_versions_rejected() -> io::Result<()> {
+    use crate::api::PaddingPolicy::{Disabled, Optional, Required};
+
+    for policy in [Disabled, Optional, Required] {
+        run_padding_loopback_case(None, Some(policy), None)?;
+        run_padding_loopback_case(Some(policy), None, None)?;
+    }
+
+    Ok(())
+}
+
+#[test]
+fn public_file_upload_with_required_padding_completes() -> io::Result<()> {
+    run_upload_case_with_padding(false, true)
+}
+
+#[test]
+fn public_file_upload_with_required_padding_resumes() -> io::Result<()> {
+    run_upload_case_with_padding(true, true)
+}
+
+#[test]
+fn padded_file_upload_rotates_after_every_exchange() -> io::Result<()> {
+    run_rotating_upload_case_with_padding(1, None, true)
+}
+
+#[test]
+fn padded_file_upload_rotates_after_two_exchanges() -> io::Result<()> {
+    run_rotating_upload_case_with_padding(2, None, true)
+}
+
+#[test]
+fn padded_file_upload_rotates_before_sending_byte_exhaustion() -> io::Result<()> {
+    run_rotating_upload_case_with_padding(u64::MAX, Some(CapacityRestriction::SendingBytes), true)
+}
+
+#[test]
+fn padded_file_upload_rotates_before_receiving_byte_exhaustion() -> io::Result<()> {
+    run_rotating_upload_case_with_padding(u64::MAX, Some(CapacityRestriction::ReceivingBytes), true)
+}
+
+#[test]
+fn padded_file_upload_rotates_when_remaining_lifetime_is_too_short() -> io::Result<()> {
+    run_rotating_upload_case_with_padding(u64::MAX, Some(CapacityRestriction::Lifetime), true)
+}
+
+#[test]
+fn upload_exchange_error_clears_counter_without_reconnecting() -> io::Result<()> {
+    use std::cell::Cell;
+
+    use crate::{FileUploadConnection, FileUploadRotation};
+
+    for padded in [false, true] {
+        let directory = TestDirectory::new()?;
+        let payload = b"counter reset regression";
+        fs::write(directory.source(), payload)?;
+
+        let expected_size = payload.len() as u64;
+        let mut source = FileUploadSource::open(directory.source(), expected_size)?;
+
+        let ca = fixture("ca.cert.der")?;
+        let certificate = fixture("server.cert.der")?;
+        let private_key = fixture("server.key.der")?;
+        let timeouts = connection_timeouts()?;
+
+        let server = Server::new(&[certificate.as_slice()], &private_key, timeouts)?;
+
+        let server = if padded {
+            server.with_padding(crate::api::PaddingPolicy::Required)
+        } else {
+            server
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+
+        let mut service = FileTransferService::create(
+            directory.uploads(),
+            FileTransferLimits {
+                max_file_size: expected_size,
+                max_reserved_bytes: expected_size,
+                max_uploads: 1,
+                max_uploads_per_owner: 1,
+            },
+        )?;
+
+        let server_thread = thread::spawn(move || -> io::Result<()> {
+            let socket = accept_with_timeout(&listener)?;
+
+            let mut connection = server
+                .accept(socket)?
+                .authenticate(&TestAuthenticator, OPERATION_BUDGET)?
+                .establish_keys(OPERATION_BUDGET)?;
+
+            loop {
+                match service.serve_one(connection, OPERATION_BUDGET, |identity| {
+                    identity.as_str() == "file-loopback-client"
+                }) {
+                    Ok(next) => connection = next,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::UnexpectedEof
+                                | io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::ConnectionAborted
+                                | io::ErrorKind::BrokenPipe
+                        ) =>
+                    {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        });
+
+        let client_result = (|| -> io::Result<()> {
+            let connected = Cell::new(0_usize);
+
+            let mut transfer = FileUploadConnection::new(
+                || {
+                    let connection = connect_upload_case(address, &ca, timeouts, padded)?;
+
+                    connected.set(connected.get() + 1);
+                    Ok(connection)
+                },
+                FileUploadRotation {
+                    max_exchanges: u64::MAX,
+                    lifetime_margin: Duration::from_secs(1),
+                },
+            )?;
+
+            let result = (|| -> io::Result<()> {
+                let upload = transfer.begin(&source, OPERATION_BUDGET)?;
+
+                ensure(
+                    transfer.successful_exchanges() == 1,
+                    "Begin did not retain one successful exchange",
+                )?;
+
+                let mut offset = 0_u64;
+
+                while offset < source.size() {
+                    let next =
+                        transfer.send_next(&mut source, &upload, offset, OPERATION_BUDGET)?;
+
+                    ensure(next > offset, "upload did not advance")?;
+                    offset = next;
+                }
+
+                ensure(
+                    offset == source.size(),
+                    "upload ended at an unexpected offset",
+                )?;
+                ensure(
+                    transfer.successful_exchanges() > 0,
+                    "regression requires a nonzero exchange count",
+                )?;
+                ensure(
+                    connected.get() == 1,
+                    "setup unexpectedly rotated the connection",
+                )?;
+
+                let connections_before_error = connected.get();
+
+                let error = match transfer.send_next(&mut source, &upload, offset, OPERATION_BUDGET)
+                {
+                    Err(error) => error,
+                    Ok(_) => {
+                        return Err(io::Error::other("sending at EOF unexpectedly succeeded"));
+                    }
+                };
+
+                ensure(
+                    error.to_string() == "upload source is at EOF; request final verification",
+                    "send_next failed for an unexpected reason",
+                )?;
+                ensure(
+                    transfer.successful_exchanges() == 0,
+                    "failed operation retained a stale exchange count",
+                )?;
+                ensure(
+                    connected.get() == connections_before_error,
+                    "failed operation unexpectedly reconnected",
+                )?;
+
+                Ok(())
+            })();
+
+            // Close even when a client assertion fails, before joining.
+            transfer.close();
+            result
+        })();
+
+        let server_result = server_thread
+            .join()
+            .map_err(|_| io::Error::other("counter regression server panicked"))?;
+
+        client_result?;
+        server_result?;
+    }
+
+    Ok(())
 }

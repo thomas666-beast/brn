@@ -8,7 +8,7 @@ use rustls::{ClientConnection, ProtocolVersion, StreamOwned};
 
 use crate::session::Session;
 use crate::state::ConnectionEvent;
-use crate::tls::{ALPN_PROTOCOL, build_client_config};
+use crate::tls::{BrnVersion, build_client_config_for_version};
 use crate::transport::DeadlineTcpStream;
 
 pub(crate) type ClientTlsStream = StreamOwned<ClientConnection, DeadlineTcpStream>;
@@ -37,7 +37,7 @@ impl ClientTimeouts {
     }
 }
 
-/// Establishes and verifies TLS, then returns a BRN session.
+/// Establishes and verifies TLS for BRN v1, then returns a session.
 ///
 /// `address` is the network destination.
 /// `expected_server_name` is the certificate identity to verify.
@@ -50,10 +50,30 @@ pub(crate) fn connect_tls(
     trusted_ca_certificates: &[&[u8]],
     timeouts: ClientTimeouts,
 ) -> io::Result<Session<ClientTlsStream>> {
+    connect_tls_for_version(
+        address,
+        expected_server_name,
+        trusted_ca_certificates,
+        timeouts,
+        BrnVersion::V1,
+    )
+}
+
+/// Establishes and verifies TLS for exactly one BRN version.
+///
+/// The caller must run the matching BRN negotiation afterward.
+/// No automatic retry or fallback to another version is performed.
+pub(crate) fn connect_tls_for_version(
+    address: SocketAddr,
+    expected_server_name: &str,
+    trusted_ca_certificates: &[&[u8]],
+    timeouts: ClientTimeouts,
+    version: BrnVersion,
+) -> io::Result<Session<ClientTlsStream>> {
     let server_name = ServerName::try_from(expected_server_name.to_owned())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
-    let config = build_client_config(trusted_ca_certificates)
+    let config = build_client_config_for_version(trusted_ca_certificates, version)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
     let mut connection = ClientConnection::new(Arc::new(config), server_name)
@@ -84,11 +104,13 @@ pub(crate) fn connect_tls(
         ));
     }
 
-    if connection.alpn_protocol() != Some(ALPN_PROTOCOL) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "TLS peer did not negotiate brn/1",
-        ));
+    if connection.alpn_protocol() != Some(version.alpn()) {
+        let message = match version {
+            BrnVersion::V1 => "TLS peer did not negotiate brn/1",
+            BrnVersion::V2 => "TLS peer did not negotiate brn/2",
+        };
+
+        return Err(io::Error::new(io::ErrorKind::InvalidData, message));
     }
 
     transport.clear_deadline();
@@ -165,5 +187,37 @@ mod tests {
             error.to_string(),
             "at least one trusted CA certificate is required"
         );
+    }
+
+    #[test]
+    fn versioned_clients_reject_invalid_server_name_before_connecting() {
+        let timeouts = ClientTimeouts::new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        for version in [BrnVersion::V1, BrnVersion::V2] {
+            let result = connect_tls_for_version(
+                "127.0.0.1:0".parse().unwrap(),
+                "invalid name with spaces",
+                &[],
+                timeouts,
+                version,
+            );
+
+            let error = match result {
+                Ok(_) => panic!("invalid server name unexpectedly accepted"),
+                Err(error) => error,
+            };
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+
+            assert_ne!(
+                error.to_string(),
+                "at least one trusted CA certificate is required"
+            );
+        }
     }
 }

@@ -7,7 +7,7 @@ use rustls::{ProtocolVersion, ServerConfig, ServerConnection, StreamOwned};
 
 use crate::session::Session;
 use crate::state::ConnectionEvent;
-use crate::tls::ALPN_PROTOCOL;
+use crate::tls::BrnVersion;
 use crate::transport::DeadlineTcpStream;
 
 pub(crate) type ServerTlsStream = StreamOwned<ServerConnection, DeadlineTcpStream>;
@@ -31,7 +31,7 @@ impl ServerTimeouts {
     }
 }
 
-/// Completes TLS on an already accepted TCP socket.
+/// Completes TLS on an already accepted TCP socket for BRN v1.
 ///
 /// The configuration should come from `build_server_config`.
 ///
@@ -42,6 +42,26 @@ pub(crate) fn accept_tls(
     config: Arc<ServerConfig>,
     timeouts: ServerTimeouts,
 ) -> io::Result<Session<ServerTlsStream>> {
+    accept_tls_for_version(socket, config, timeouts, BrnVersion::V1)
+}
+
+/// Completes TLS for exactly one BRN version.
+///
+/// The configuration must advertise only the selected version.
+/// The caller must run the matching BRN negotiation afterward.
+pub(crate) fn accept_tls_for_version(
+    socket: TcpStream,
+    config: Arc<ServerConfig>,
+    timeouts: ServerTimeouts,
+    version: BrnVersion,
+) -> io::Result<Session<ServerTlsStream>> {
+    if config.alpn_protocols.len() != 1 || config.alpn_protocols[0].as_slice() != version.alpn() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "server TLS ALPN configuration does not match the selected BRN version",
+        ));
+    }
+
     let mut connection = ServerConnection::new(config)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
 
@@ -68,11 +88,13 @@ pub(crate) fn accept_tls(
         ));
     }
 
-    if connection.alpn_protocol() != Some(ALPN_PROTOCOL) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "TLS peer did not negotiate brn/1",
-        ));
+    if connection.alpn_protocol() != Some(version.alpn()) {
+        let message = match version {
+            BrnVersion::V1 => "TLS peer did not negotiate brn/1",
+            BrnVersion::V2 => "TLS peer did not negotiate brn/2",
+        };
+
+        return Err(io::Error::new(io::ErrorKind::InvalidData, message));
     }
 
     transport.clear_deadline();
@@ -86,7 +108,6 @@ pub(crate) fn accept_tls(
 
     Ok(session)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

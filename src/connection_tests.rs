@@ -740,3 +740,526 @@ fn public_api_closed_status_tracks_local_failure() -> io::Result<()> {
         },
     )
 }
+
+/// Runs public TLS + BRN negotiation without authentication.
+///
+/// None selects the existing v1 API.
+/// Some(policy) selects the explicit v2 API.
+fn run_public_version_pair(
+    client_policy: Option<crate::api::PaddingPolicy>,
+    server_policy: Option<crate::api::PaddingPolicy>,
+) -> io::Result<(io::Result<()>, io::Result<()>)> {
+    use crate::{ConnectionTimeouts, PendingClient, Server};
+
+    let ca = development_file("ca.cert.der")?;
+    let certificate = development_file("server.cert.der")?;
+    let key = development_file("server.key.der")?;
+
+    let timeouts = ConnectionTimeouts::new(
+        Duration::from_secs(5),
+        Duration::from_secs(3),
+        Duration::from_secs(2),
+    )?;
+
+    let server = Server::new(&[certificate.as_slice()], &key, timeouts)?;
+
+    let server = match server_policy {
+        None => server,
+        Some(policy) => server.with_padding(policy),
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+
+    let server_thread = thread::spawn(move || -> io::Result<()> {
+        let socket = accept_with_timeout(&listener, Duration::from_secs(5))?;
+        let pending = server.accept(socket)?;
+        pending.close();
+        Ok(())
+    });
+
+    let client_result = (|| -> io::Result<()> {
+        let pending = match client_policy {
+            None => PendingClient::connect(
+                address,
+                "localhost",
+                &[ca.as_slice()],
+                Duration::from_secs(2),
+                timeouts,
+            )?,
+            Some(policy) => PendingClient::connect_with_padding(
+                address,
+                "localhost",
+                &[ca.as_slice()],
+                Duration::from_secs(2),
+                timeouts,
+                policy,
+            )?,
+        };
+
+        pending.close();
+        Ok(())
+    })();
+
+    let server_result = server_thread
+        .join()
+        .map_err(|_| io::Error::other("version-boundary server panicked"))?;
+
+    Ok((client_result, server_result))
+}
+
+#[test]
+fn public_alpn_v1_to_v1_succeeds() -> io::Result<()> {
+    let (client_result, server_result) = run_public_version_pair(None, None)?;
+
+    client_result?;
+    server_result?;
+
+    Ok(())
+}
+
+#[test]
+fn public_alpn_v2_matching_policies_succeed() -> io::Result<()> {
+    use crate::api::PaddingPolicy;
+
+    for policy in [
+        PaddingPolicy::Disabled,
+        PaddingPolicy::Optional,
+        PaddingPolicy::Required,
+    ] {
+        let (client_result, server_result) = run_public_version_pair(Some(policy), Some(policy))?;
+
+        assert!(
+            client_result.is_ok(),
+            "v2 client failed for {policy:?}: {client_result:?}"
+        );
+        assert!(
+            server_result.is_ok(),
+            "v2 server failed for {policy:?}: {server_result:?}"
+        );
+    }
+
+    Ok(())
+}
+
+/// Requires a local TLS no-overlapping-ALPN error, rather than
+/// accepting any arbitrary connection failure as a passing test.
+fn assert_server_alpn_mismatch(error: &io::Error) {
+    let tls_error = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>());
+
+    assert!(
+        matches!(tls_error, Some(rustls::Error::NoApplicationProtocol)),
+        "expected server TLS NoApplicationProtocol, got: {error:?}"
+    );
+}
+
+#[test]
+fn public_alpn_v1_client_to_v2_server_is_rejected() -> io::Result<()> {
+    use crate::api::PaddingPolicy;
+
+    for policy in [
+        PaddingPolicy::Disabled,
+        PaddingPolicy::Optional,
+        PaddingPolicy::Required,
+    ] {
+        let (client_result, server_result) = run_public_version_pair(None, Some(policy))?;
+
+        assert!(
+            client_result.is_err(),
+            "v1 client unexpectedly connected to v2 server with {policy:?}"
+        );
+
+        let server_error = server_result.expect_err("v2 server unexpectedly accepted a v1 client");
+
+        assert_server_alpn_mismatch(&server_error);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn public_alpn_v2_client_to_v1_server_is_rejected() -> io::Result<()> {
+    use crate::api::PaddingPolicy;
+
+    for policy in [
+        PaddingPolicy::Disabled,
+        PaddingPolicy::Optional,
+        PaddingPolicy::Required,
+    ] {
+        let (client_result, server_result) = run_public_version_pair(Some(policy), None)?;
+
+        assert!(
+            client_result.is_err(),
+            "v2 client with {policy:?} unexpectedly connected to v1 server"
+        );
+
+        let server_error = server_result.expect_err("v1 server unexpectedly accepted a v2 client");
+
+        assert_server_alpn_mismatch(&server_error);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn public_v2_incompatible_padding_policies_are_rejected() -> io::Result<()> {
+    use crate::api::PaddingPolicy::{Disabled, Required};
+
+    for (client_policy, server_policy) in [(Required, Disabled), (Disabled, Required)] {
+        let (client_result, server_result) =
+            run_public_version_pair(Some(client_policy), Some(server_policy))?;
+
+        let client_error =
+            client_result.expect_err("client accepted incompatible padding policies");
+
+        let server_error =
+            server_result.expect_err("server accepted incompatible padding policies");
+
+        assert_eq!(
+            server_error.kind(),
+            io::ErrorKind::InvalidData,
+            "unexpected server error for client={client_policy:?}, \
+             server={server_policy:?}: {server_error:?}",
+        );
+
+        assert_eq!(
+            server_error.to_string(),
+            "no common padding profile",
+            "server must reject the profile intersection, \
+             not fail for an unrelated reason",
+        );
+
+        // The server closes without selecting a profile. The client's
+        // transport error can vary, but negotiation must not succeed.
+        assert!(
+            matches!(
+                client_error.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+            ),
+            "unexpected client error for client={client_policy:?}, \
+             server={server_policy:?}: {client_error:?}",
+        );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn public_v2_required_padding_preserves_application_payloads() -> io::Result<()> {
+    use crate::api::PaddingPolicy;
+    use crate::{
+        AuthenticationError, Authenticator, ClientIdentity, ConnectionTimeouts, PendingClient,
+        Server,
+    };
+
+    struct TestAuthenticator;
+
+    impl Authenticator for TestAuthenticator {
+        fn authenticate(&self, credentials: &[u8]) -> Result<ClientIdentity, AuthenticationError> {
+            if credentials != b"v2-padding-round-trip" {
+                return Err(AuthenticationError::Unavailable);
+            }
+
+            ClientIdentity::new("v2-padding-client").map_err(|_| AuthenticationError::Unavailable)
+        }
+    }
+
+    let ca = development_file("ca.cert.der")?;
+    let certificate = development_file("server.cert.der")?;
+    let key = development_file("server.key.der")?;
+
+    let timeouts = ConnectionTimeouts::new(
+        Duration::from_secs(5),
+        Duration::from_secs(3),
+        Duration::from_secs(2),
+    )?;
+
+    let server = Server::new(&[certificate.as_slice()], &key, timeouts)?
+        .with_padding(PaddingPolicy::Required);
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let budget = Duration::from_secs(5);
+    let payloads: Vec<Vec<u8>> = [0usize, 1, 251, 252, 253, 507, 508, 509, 513, 61_436]
+        .into_iter()
+        .map(|length| (0..length).map(|index| (index % 256) as u8).collect())
+        .collect();
+
+    let expected_requests = payloads.clone();
+
+    let server_thread = thread::spawn(move || -> io::Result<()> {
+        let socket = accept_with_timeout(&listener, budget)?;
+
+        let mut ready = server
+            .accept(socket)?
+            .authenticate(&TestAuthenticator, budget)?
+            .establish_keys(budget)?;
+
+        for expected in expected_requests {
+            let actual = ready.receive_request(budget)?;
+
+            if actual != expected {
+                return Err(io::Error::other("v2 request payload was not preserved"));
+            }
+
+            let response: Vec<u8> = expected.iter().map(|byte| byte ^ 0xff).collect();
+
+            ready.respond(&response, budget)?;
+        }
+
+        ready.close();
+        Ok(())
+    });
+
+    let client_result = (|| -> io::Result<()> {
+        let mut ready = PendingClient::connect_with_padding(
+            address,
+            "localhost",
+            &[ca.as_slice()],
+            Duration::from_secs(2),
+            timeouts,
+            PaddingPolicy::Required,
+        )?
+        .authenticate(b"v2-padding-round-trip", budget)?
+        .establish_keys(budget)?;
+
+        for request in payloads {
+            let expected_response: Vec<u8> = request.iter().map(|byte| byte ^ 0xff).collect();
+
+            let actual = ready.request(&request, budget)?;
+
+            if actual != expected_response {
+                return Err(io::Error::other("v2 response payload was not preserved"));
+            }
+        }
+
+        ready.close();
+        Ok(())
+    })();
+
+    let server_result = server_thread
+        .join()
+        .map_err(|_| io::Error::other("v2 round-trip server panicked"))?;
+
+    client_result?;
+    server_result?;
+
+    Ok(())
+}
+
+#[test]
+fn public_v2_oversized_padded_request_prevents_reuse() -> io::Result<()> {
+    use crate::api::PaddingPolicy;
+    use crate::{
+        AuthenticationError, Authenticator, ClientIdentity, ConnectionTimeouts, PendingClient,
+        Server,
+    };
+
+    struct TestAuthenticator;
+
+    impl Authenticator for TestAuthenticator {
+        fn authenticate(&self, credentials: &[u8]) -> Result<ClientIdentity, AuthenticationError> {
+            if credentials != b"v2-oversized-request" {
+                return Err(AuthenticationError::Unavailable);
+            }
+
+            ClientIdentity::new("v2-oversized-client").map_err(|_| AuthenticationError::Unavailable)
+        }
+    }
+
+    let ca = development_file("ca.cert.der")?;
+    let certificate = development_file("server.cert.der")?;
+    let key = development_file("server.key.der")?;
+
+    let timeouts = ConnectionTimeouts::new(
+        Duration::from_secs(5),
+        Duration::from_secs(3),
+        Duration::from_secs(2),
+    )?;
+
+    let server = Server::new(&[certificate.as_slice()], &key, timeouts)?
+        .with_padding(PaddingPolicy::Required);
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let budget = Duration::from_secs(5);
+
+    let server_thread = thread::spawn(move || -> io::Result<()> {
+        let socket = accept_with_timeout(&listener, budget)?;
+
+        let mut ready = server
+            .accept(socket)?
+            .authenticate(&TestAuthenticator, budget)?
+            .establish_keys(budget)?;
+
+        // The client should reject its request locally and close.
+        // No application request should be delivered successfully.
+        assert!(ready.receive_request(budget).is_err());
+        assert!(ready.is_closed());
+
+        assert!(ready.receive_request(budget).is_err());
+        assert!(ready.respond(b"late response", budget).is_err());
+
+        ready.close();
+        Ok(())
+    });
+
+    // Catch client assertions so the server thread is still joined.
+    let client_result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<()> {
+            let mut ready = PendingClient::connect_with_padding(
+                address,
+                "localhost",
+                &[ca.as_slice()],
+                Duration::from_secs(2),
+                timeouts,
+                PaddingPolicy::Required,
+            )?
+            .authenticate(b"v2-oversized-request", budget)?
+            .establish_keys(budget)?;
+
+            let oversized = vec![0xa5; 61_437];
+
+            let error = ready
+                .request(&oversized, budget)
+                .expect_err("oversized padded request unexpectedly succeeded");
+
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(ready.is_closed());
+
+            assert!(ready.request(b"valid-sized retry", budget).is_err());
+            assert!(ready.is_closed());
+
+            ready.close();
+            Ok(())
+        }));
+
+    let server_result = server_thread.join();
+
+    let client_result = match client_result {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
+
+    let server_result =
+        server_result.map_err(|_| io::Error::other("oversized-request server panicked"))?;
+
+    client_result?;
+    server_result?;
+
+    Ok(())
+}
+
+#[test]
+fn public_v2_oversized_padded_response_prevents_reuse() -> io::Result<()> {
+    use crate::api::PaddingPolicy;
+    use crate::{
+        AuthenticationError, Authenticator, ClientIdentity, ConnectionTimeouts, PendingClient,
+        Server,
+    };
+
+    struct TestAuthenticator;
+
+    impl Authenticator for TestAuthenticator {
+        fn authenticate(&self, credentials: &[u8]) -> Result<ClientIdentity, AuthenticationError> {
+            if credentials != b"v2-oversized-response" {
+                return Err(AuthenticationError::Unavailable);
+            }
+
+            ClientIdentity::new("v2-oversized-client").map_err(|_| AuthenticationError::Unavailable)
+        }
+    }
+
+    let ca = development_file("ca.cert.der")?;
+    let certificate = development_file("server.cert.der")?;
+    let key = development_file("server.key.der")?;
+
+    let timeouts = ConnectionTimeouts::new(
+        Duration::from_secs(5),
+        Duration::from_secs(3),
+        Duration::from_secs(2),
+    )?;
+
+    let server = Server::new(&[certificate.as_slice()], &key, timeouts)?
+        .with_padding(PaddingPolicy::Required);
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let budget = Duration::from_secs(5);
+
+    let server_thread = thread::spawn(move || -> io::Result<()> {
+        let socket = accept_with_timeout(&listener, budget)?;
+
+        let mut ready = server
+            .accept(socket)?
+            .authenticate(&TestAuthenticator, budget)?
+            .establish_keys(budget)?;
+
+        // Receive a valid request before attempting the oversized response.
+        let _request = ready.receive_request(budget)?;
+
+        let oversized = vec![0xa5; 61_437];
+
+        let error = ready
+            .respond(&oversized, budget)
+            .expect_err("oversized padded response unexpectedly succeeded");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(ready.is_closed());
+
+        // Neither sending nor receiving may revive the connection.
+        assert!(ready.respond(b"valid-sized retry", budget).is_err());
+        assert!(ready.receive_request(budget).is_err());
+        assert!(ready.is_closed());
+
+        ready.close();
+        Ok(())
+    });
+
+    // Catch client assertions so the server thread is still joined.
+    let client_result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> io::Result<()> {
+            let mut ready = PendingClient::connect_with_padding(
+                address,
+                "localhost",
+                &[ca.as_slice()],
+                Duration::from_secs(2),
+                timeouts,
+                PaddingPolicy::Required,
+            )?
+            .authenticate(b"v2-oversized-response", budget)?
+            .establish_keys(budget)?;
+
+            // The server receives this request, but its oversized
+            // response must fail rather than reach the client.
+            assert!(ready.request(b"valid request", budget).is_err());
+            assert!(ready.is_closed());
+
+            // A valid-sized retry must not revive the connection.
+            assert!(ready.request(b"valid-sized retry", budget).is_err());
+            assert!(ready.is_closed());
+
+            ready.close();
+            Ok(())
+        }));
+
+    let server_result = server_thread.join();
+
+    let client_result = match client_result {
+        Ok(result) => result,
+        Err(payload) => std::panic::resume_unwind(payload),
+    };
+
+    let server_result =
+        server_result.map_err(|_| io::Error::other("oversized-response server panicked"))?;
+
+    client_result?;
+    server_result?;
+
+    Ok(())
+}
